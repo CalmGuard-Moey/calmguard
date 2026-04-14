@@ -64,6 +64,17 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
   Timer? voiceCooldownTimer;
 
   DateTime? micBlockedUntil;
+  DateTime? watchOverrideUntil;
+
+  bool get isMicBlocked {
+    if (micBlockedUntil == null) return false;
+    return DateTime.now().isBefore(micBlockedUntil!);
+  }
+
+  bool get isWatchOverrideActive {
+    if (watchOverrideUntil == null) return false;
+    return DateTime.now().isBefore(watchOverrideUntil!);
+  }
 
   @override
   void initState() {
@@ -117,23 +128,38 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
       if (!mounted) return;
       setState(() {
         isSpeaking = false;
-        appStatus = 'Monitoring';
+        appStatus = triggered
+            ? 'Triggered'
+            : warning
+                ? 'Warning'
+                : 'Monitoring';
       });
     });
   }
 
   void setupWatchChannel() {
     watchChannel.setMethodCallHandler((call) async {
-      if (call.method == 'watchTrigger' || call.method == 'watch_trigger') {
-        handleWatchTrigger();
+      switch (call.method) {
+        case 'watch_warning':
+        case 'watchWarning':
+          handleWatchWarning();
+          break;
+
+        case 'watch_trigger':
+        case 'watchTrigger':
+          handleWatchTrigger();
+          break;
+
+        case 'watch_reset':
+        case 'watchReset':
+          handleWatchReset();
+          break;
+
+        default:
+          break;
       }
       return;
     });
-  }
-
-  bool get isMicBlocked {
-    if (micBlockedUntil == null) return false;
-    return DateTime.now().isBefore(micBlockedUntil!);
   }
 
   Future<void> speakMessage(String message) async {
@@ -204,7 +230,6 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
       cancelOnError: true,
       onResult: (result) {
         if (!mounted) return;
-
         if (isSpeaking || isMicBlocked) return;
 
         final words = result.recognizedWords;
@@ -257,8 +282,27 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
     });
   }
 
+  void handleWatchWarning() {
+    if (!mounted) return;
+
+    watchOverrideUntil = DateTime.now().add(const Duration(seconds: 8));
+
+    setState(() {
+      warning = true;
+      triggered = false;
+      warningSpoken = false;
+      triggerReason = 'Watch detected rising stress';
+      appStatus = 'Warning';
+      heardText = 'Watch warning received.';
+    });
+
+    Vibration.vibrate(duration: 300);
+  }
+
   void handleWatchTrigger() {
     if (!mounted) return;
+
+    watchOverrideUntil = DateTime.now().add(const Duration(seconds: 12));
 
     setState(() {
       heartRate = 110;
@@ -278,6 +322,35 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
     Future.delayed(const Duration(milliseconds: 1200), () {
       if (!mounted) return;
       startTemporaryListeningWindow();
+    });
+  }
+
+  void handleWatchReset() {
+    if (!mounted) return;
+
+    watchOverrideUntil = DateTime.now().add(const Duration(seconds: 10));
+
+    setState(() {
+      triggered = false;
+      warning = false;
+      warningSpoken = false;
+      triggerReason = 'All signals normal';
+      appStatus = 'Monitoring';
+      heardText = 'Watch reset received.';
+      heartRateHighTime = 0;
+      stressHighTime = 0;
+      voiceHighTime = 0;
+      voiceStress = 20;
+      stressLevel = 20;
+      heartRate = 72;
+    });
+
+    flutterTts.stop();
+    speech.stop();
+
+    setState(() {
+      isListening = false;
+      isSpeaking = false;
     });
   }
 
@@ -347,6 +420,7 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
       appStatus = 'Monitoring';
       heardText = 'Nothing heard yet';
       micBlockedUntil = null;
+      watchOverrideUntil = null;
     });
 
     flutterTts.stop();
@@ -354,6 +428,10 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
   }
 
   void checkTrigger() {
+    if (isWatchOverrideActive) {
+      return;
+    }
+
     if (heartRate >= heartRateThreshold) {
       heartRateHighTime++;
     } else {
@@ -794,8 +872,18 @@ class _CalmGuardHomeState extends State<CalmGuardHome> {
                       ),
                       const SizedBox(height: 12),
                       buildTestButton(
+                        'Simulate Watch Warning',
+                        handleWatchWarning,
+                      ),
+                      const SizedBox(height: 12),
+                      buildTestButton(
                         'Simulate Watch Trigger',
                         handleWatchTrigger,
+                      ),
+                      const SizedBox(height: 12),
+                      buildTestButton(
+                        'Simulate Watch Reset',
+                        handleWatchReset,
                       ),
                       const SizedBox(height: 12),
                       buildTestButton('Reset All', resetAll),
