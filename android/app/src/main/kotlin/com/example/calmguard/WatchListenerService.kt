@@ -1,9 +1,7 @@
 package com.example.calmguard
 
-import android.os.Handler
-import android.os.Looper
+import android.content.Intent
 import android.util.Log
-import android.widget.Toast
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.WearableListenerService
 
@@ -12,19 +10,28 @@ class WatchListenerService : WearableListenerService() {
     override fun onMessageReceived(messageEvent: MessageEvent) {
         super.onMessageReceived(messageEvent)
 
-        val path = messageEvent.path
-        val message = String(messageEvent.data)
+        when (messageEvent.path) {
+            "/heart_rate" -> {
+                val heartRate = String(messageEvent.data).toIntOrNull()
+                Log.d("WatchListenerService", "Received heart rate: $heartRate")
 
-        Log.e("CalmGuardPhone", "Received path: $path")
-        Log.e("CalmGuardPhone", "Message from watch: $message")
+                if (heartRate != null) {
+                    val intent = Intent("WATCH_HEART_RATE_UPDATE")
+                    intent.putExtra("heart_rate", heartRate)
+                    sendBroadcast(intent)
+                }
+            }
 
-        if (path == "/calmguard_data") {
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(
-                    applicationContext,
-                    "Watch sent: $message",
-                    Toast.LENGTH_LONG
-                ).show()
+            "/watch_warning" -> {
+                Log.d("WatchListenerService", "Received watch warning")
+            }
+
+            "/watch_trigger" -> {
+                Log.d("WatchListenerService", "Received watch trigger")
+            }
+
+            "/watch_reset" -> {
+                Log.d("WatchListenerService", "Received watch reset")
             }
         }
     }

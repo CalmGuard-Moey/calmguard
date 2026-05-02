@@ -4,12 +4,12 @@ plugins {
 }
 
 android {
-    namespace = "com.example.calmguard"
+    namespace = "com.example.calmguardwear"
     compileSdk = 34
 
     defaultConfig {
         applicationId = "com.example.calmguard"
-        minSdk = 26
+        minSdk = 30
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
@@ -34,4 +34,6 @@ kotlin {
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("com.google.android.gms:play-services-wearable:18.2.0")
+    implementation("androidx.health:health-services-client:1.0.0-rc01")
+    implementation("com.google.guava:guava:31.1-android")
 }
