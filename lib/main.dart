@@ -88,6 +88,7 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   DateTime? lastTriggerTime;
   DateTime? lastWarningTime;
   DateTime? uiWarningHoldStart;
+  DateTime? cooldownEndTime;
 
   double smoothedWatchStress = 20.0;
   double personalHrBaseline = 72.0;
@@ -105,6 +106,9 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   bool stopVoiceWatchRequested = false;
   bool allowVoiceCheck = false;
   bool ttsReady = false;
+  bool cooldownActive = false;
+  bool recoveryActive = false;
+  DateTime? recoveryEndTime;
 
   Timer? evaluationTimer;
   Timer? voiceWindowTimer;
@@ -213,6 +217,39 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     }
   }
 
+void applyVoiceDecay() {
+  // ❌ Do NOT decay during active situations
+  if (stage == AlertStage.triggered) return;
+  if (cooldownActive) return;
+  if (isListening || isSpeaking) return;
+
+  final learnedHrBaseline =
+      personalHrBaselineSamples < 10 ? 72.0 : personalHrBaseline;
+
+  final hrDiff = (watchHeartRate - learnedHrBaseline).abs();
+
+  final noRecentConcern = lastVoiceContextTime == null ||
+      DateTime.now().difference(lastVoiceContextTime!).inSeconds > 25;
+
+  // ✅ Only decay when calm conditions
+  if (hrDiff <= 8 && noRecentConcern) {
+  setState(() { 
+    voiceAiScore = (voiceAiScore - 4).clamp(0.0, 100.0);
+    voiceLevel = (voiceLevel - 2).clamp(0.0, 100.0);
+
+    // Reset when almost calm
+    if (voiceAiScore <= 8) {
+      voiceAiScore = 0.0;
+      voiceSpikesLastMinute = 0;
+      voiceBehaviourStatus = 'Voice calm';
+      voiceContextScore = 0.0;
+      voiceContextStatus = 'No concerning words detected';
+      lastVoiceContextTime = null;
+    }
+  });
+  }
+}
+
   Future<void> initTts() async {
     await flutterTts.setLanguage('en-AU');
     await flutterTts.setSpeechRate(0.45);
@@ -303,6 +340,7 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     evaluationTimer?.cancel();
     evaluationTimer = Timer.periodic(const Duration(seconds: 2), (_) {
       evaluateSmartState();
+      applyVoiceDecay();
     });
   }
 
@@ -517,7 +555,45 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   }
 
   void evaluateSmartState() {
-    calculateLiveStress();
+    if (cooldownActive) {
+  if (cooldownEndTime != null &&
+      DateTime.now().isAfter(cooldownEndTime!)) {
+    cooldownActive = false;
+    cooldownEndTime = null;
+
+    recoveryActive = true;
+    recoveryEndTime = DateTime.now().add(const Duration(seconds: 20));
+
+    setState(() {
+      stage = AlertStage.monitoring;
+      warning = false;
+      triggered = false;
+      appStatus = 'Recovering...';
+      triggerReason = 'Cooldown complete';
+      voiceWatchMode = false;
+      allowVoiceCheck = false;
+      stopVoiceWatchRequested = true;
+    });
+  } else {
+    return;
+  }
+}
+
+if (recoveryActive) {
+  if (recoveryEndTime != null &&
+      DateTime.now().isAfter(recoveryEndTime!)) {
+    recoveryActive = false;
+    recoveryEndTime = null;
+
+    setState(() {
+      appStatus = 'Monitoring';
+      triggerReason = 'Recovery complete';
+    });
+  } else {
+    return;
+  }
+}
+  calculateLiveStress();
 
     final decision = engine.evaluate(
       heartRate: watchHeartRate.toDouble(),
@@ -570,19 +646,21 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
 
     if (decision.action == EngineAction.trigger &&
         stage != AlertStage.triggered) {
+      cooldownActive = true;
+      cooldownEndTime = DateTime.now().add(const Duration(seconds: 45));    
+
       setState(() {
         stage = AlertStage.triggered;
         warning = false;
         triggered = true;
-        voiceWatchMode = true;
-        allowVoiceCheck = true;
-        stopVoiceWatchRequested = false;
+        voiceWatchMode = false;
+        allowVoiceCheck = false;
+        stopVoiceWatchRequested = true;
         appStatus = 'Triggered';
         triggerReason = decision.reason;
         lastTriggerTime = DateTime.now();
       });
 
-      ensureVoiceWatchListening();
       speakMessage('Calm down. Take a breath. You are in control.');
       vibrateTrigger();
       return;
