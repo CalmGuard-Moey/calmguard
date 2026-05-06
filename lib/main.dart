@@ -569,17 +569,20 @@ void applyVoiceDecay() {
       warning = false;
       triggered = false;
       appStatus = 'Recovering...';
-      triggerReason = 'Cooldown complete';
+      triggerReason = 'Cooldown complete. Letting signals settle.';  
       voiceWatchMode = false;
       allowVoiceCheck = false;
       stopVoiceWatchRequested = true;
     });
+    return;
   } else {
     return;
   }
 }
 
 if (recoveryActive) {
+  applyVoiceDecay();
+
   if (recoveryEndTime != null &&
       DateTime.now().isAfter(recoveryEndTime!)) {
     recoveryActive = false;
@@ -589,6 +592,7 @@ if (recoveryActive) {
       appStatus = 'Monitoring';
       triggerReason = 'Recovery complete';
     });
+    return;
   } else {
     return;
   }
