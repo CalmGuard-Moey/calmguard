@@ -36,6 +36,18 @@ enum AlertStage {
   triggered,
 }
 
+class CalmGuardDebugLog {
+  final DateTime time;
+  final String event;
+  final String details;
+
+  const CalmGuardDebugLog({
+    required this.time,
+    required this.event,
+    required this.details,
+  });
+}
+
 class CalmGuardHome extends StatefulWidget {
   const CalmGuardHome({super.key});
 
@@ -56,6 +68,10 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   String triggerReason = 'All signals normal';
   String heardText = 'No voice sample yet';
   String patternStatus = 'No escalation pattern';
+  String setupStatus = 'Setup check not completed';
+  String privacyStatus = 'Audio is used for short voice checks only in this prototype';
+
+  final List<CalmGuardDebugLog> debugLogs = [];
 
   int watchHeartRate = 72;
 
@@ -74,7 +90,17 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   double voiceContextScore = 0.0;
   String voiceContextStatus = 'No concerning words detected';
   DateTime? lastVoiceContextTime;
+  String lastProcessedVoiceText = '';
+  DateTime? lastProcessedVoiceTextTime;
+  String lastConversationRiskCategory = 'calm';
+  double voiceConfidenceScore = 0.0;
+  bool nativePendingPullSupported = true;
+  DateTime? lastNativePendingPullTime;
   DateTime? lastAutoVoiceCheckTime;
+  Timer? voiceDebounceTimer;
+  String pendingVoiceText = '';
+  DateTime? lastSelfVoiceLogTime;
+  String lastSelfVoiceText = '';
   bool smartVoiceSessionActive = false;
   DateTime? smartVoiceSessionEndTime;
 
@@ -113,9 +139,29 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   Timer? evaluationTimer;
   Timer? voiceWindowTimer;
   Timer? evaluationDebounceTimer;
+  Timer? warningAutoCalmTimer;
+  Timer? orangeVoiceRecheckTimer;
+
+  // ORANGE voice sampling rules. CalmGuard is selective, not always listening.
+  static const int orangeVoiceWindowSeconds = 20;
+  static const int orangeVoiceRecheckDelaySeconds = 25;
+  static const int maxOrangeVoiceChecksPerEvent = 3;
+
+  int orangeVoiceChecksThisEvent = 0;
+  bool orangeVoiceSamplingActive = false;
+  bool redRecoveryMessagePlayed = false;
+
+  // Best-effort phone-screen/background monitoring flag.
+  // True background reliability still depends on Android foreground service + permissions.
+  bool keepMonitoringWhenScreenLocked = true;
+
+  // Manual test guard: Simulate Warning should test ORANGE recovery only.
+  // It must not immediately escalate to RED while we are testing warning recovery.
+  bool manualWarningTestActive = false;
+  DateTime? manualWarningTestUntil;
 
   static const MethodChannel platform = MethodChannel('calmguard/watch');
-
+  static const MethodChannel voicePlatform = MethodChannel('calmguard/voice');
   @override
   void initState() {
     super.initState();
@@ -139,6 +185,36 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
       }
     });
 
+  voicePlatform.setMethodCallHandler((call) async {
+    if (call.method == 'onNativeVoicePartial') {
+    final text = (call.arguments ?? '').toString().trim();
+    if (text.isNotEmpty) {
+      setState(() => heardText = text);
+      processVoiceText(text);
+    }
+  } else if (call.method == 'onNativeVoiceResult') {
+    final text = (call.arguments ?? '').toString().trim();
+    if (text.isNotEmpty) {
+      setState(() => heardText = text);
+      processVoiceText(text);
+    }
+  } else if (call.method == 'onNativeVoiceLevel') {
+    final level = (call.arguments as num).toDouble();
+    processVoiceLevel(normalizeVoiceLevel(level));
+  } else if (call.method == 'onNativeVoiceListening') {
+    addDebugLog('Native mic listening', '${call.arguments}');
+  } else if (call.method == 'onNativeVoiceError') {
+    addDebugLog('Native voice error', '${call.arguments}');
+  } else if (call.method == 'onNativeVoiceServiceStopped') {
+    if (mounted) {
+      setState(() {
+        isListening = false;
+        appStatus = _statusTextForStage();
+      });
+    }
+  }
+});
+
     initTts();
     initSpeech();
     startEngineLoop();
@@ -151,6 +227,9 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     evaluationTimer?.cancel();
     voiceWindowTimer?.cancel();
     evaluationDebounceTimer?.cancel();
+    warningAutoCalmTimer?.cancel();
+    orangeVoiceRecheckTimer?.cancel();
+    voiceDebounceTimer?.cancel();
     speech.stop();
     flutterTts.stop();
     super.dispose();
@@ -158,15 +237,171 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    isAppInForeground = state == AppLifecycleState.resumed;
+    // Do not automatically kill monitoring when the phone locks or the app is paused.
+    // This gives CalmGuard the best chance to keep receiving watch HR updates while testing.
+    // Full production background reliability still needs Android foreground-service support.
+    isAppInForeground = keepMonitoringWhenScreenLocked || state == AppLifecycleState.resumed;
 
-    if (!isAppInForeground) {
-      flutterTts.stop();
-      speech.stop();
-      isSpeaking = false;
-      isListening = false;
-    } else if (voiceWatchMode && !isSpeaking) {
-      ensureVoiceWatchListening();
+    if (state == AppLifecycleState.resumed) {
+      addDebugLog(
+        'App foreground',
+        'CalmGuard visible again. Monitoring continued where possible.',
+      );
+      pollPendingNativeVoiceResult();
+      if (voiceWatchMode && !isSpeaking) {
+        ensureVoiceWatchListening();
+      }
+    } else {
+      addDebugLog(
+        'App background/screen locked',
+        'Keeping monitoring active where Android allows it. Native foreground service may still be required.',
+      );
+    }
+  }
+
+
+  void addDebugLog(String event, String details) {
+    if (!mounted) return;
+
+    final log = CalmGuardDebugLog(
+      time: DateTime.now(),
+      event: event,
+      details: details,
+    );
+
+    setState(() {
+      debugLogs.insert(0, log);
+      if (debugLogs.length > 80) {
+        debugLogs.removeRange(80, debugLogs.length);
+      }
+    });
+  }
+
+  String formatLogTime(DateTime time) {
+    final h = time.hour.toString().padLeft(2, '0');
+    final m = time.minute.toString().padLeft(2, '0');
+    final s = time.second.toString().padLeft(2, '0');
+    return '$h:$m:$s';
+  }
+
+  void cancelWarningAutoCalmTimer() {
+    warningAutoCalmTimer?.cancel();
+    warningAutoCalmTimer = null;
+  }
+
+  void cancelOrangeVoiceSampling() {
+    orangeVoiceRecheckTimer?.cancel();
+    orangeVoiceRecheckTimer = null;
+    orangeVoiceChecksThisEvent = 0;
+    orangeVoiceSamplingActive = false;
+  }
+
+  void scheduleOrangeVoiceSampling({int delaySeconds = 2, String reason = 'ORANGE voice sampling'}) {
+    if (stage != AlertStage.warning) return;
+    // Native Android voice service now handles ORANGE sampling.
+    // Do not block this just because Flutter speech_to_text is not active.
+    if (orangeVoiceChecksThisEvent >= maxOrangeVoiceChecksPerEvent) {
+      addDebugLog(
+        'ORANGE voice sampling complete',
+        'Maximum short checks reached for this ORANGE event.',
+      );
+      return;
+    }
+
+    orangeVoiceRecheckTimer?.cancel();
+    orangeVoiceRecheckTimer = Timer(Duration(seconds: delaySeconds), () async {
+      if (!mounted) return;
+      if (stage != AlertStage.warning) return;
+
+      if (isSpeaking) {
+        // Important: wait for CalmGuard's own voice prompt to finish so the mic
+        // does not hear the app speaking and create false voice AI scores.
+        scheduleOrangeVoiceSampling(delaySeconds: 1, reason: reason);
+        return;
+      }
+
+      if (isListening) return;
+
+      orangeVoiceChecksThisEvent++;
+      orangeVoiceSamplingActive = true;
+      allowVoiceCheck = true;
+      voiceWatchMode = true;
+      stopVoiceWatchRequested = false;
+
+      addDebugLog(
+        'ORANGE voice check ${orangeVoiceChecksThisEvent}/$maxOrangeVoiceChecksPerEvent',
+        '$reason. Listening for $orangeVoiceWindowSeconds seconds. No CalmGuard TTS is played at mic start/end.',
+      );
+
+      await startTemporaryListeningWindow(
+        seconds: orangeVoiceWindowSeconds,
+        reason: 'ORANGE voice check',
+      );
+
+      // If the situation is still ORANGE later, run another short check.
+      // This is not always-listening. It is limited reassessment during active warning.
+      Future.delayed(
+        const Duration(seconds: orangeVoiceWindowSeconds + orangeVoiceRecheckDelaySeconds),
+        () {
+          if (!mounted) return;
+          orangeVoiceSamplingActive = false;
+          if (stage == AlertStage.warning &&
+              orangeVoiceChecksThisEvent < maxOrangeVoiceChecksPerEvent) {
+            scheduleOrangeVoiceSampling(
+              delaySeconds: 0,
+              reason: 'ORANGE still active, running another short reassessment',
+            );
+          }
+        },
+      );
+    });
+  }
+
+
+  void scheduleManualWarningAutoCalm() {
+    cancelWarningAutoCalmTimer();
+
+    // This is only for the Simulate Warning button.
+    // It creates a realistic temporary spike, then lets signals settle.
+    warningAutoCalmTimer = Timer(const Duration(seconds: 5), () {
+      if (!mounted) return;
+      if (stage != AlertStage.warning) return;
+
+      setState(() {
+        watchHeartRate = 72;
+        stressLevel = 20;
+        smoothedWatchStress = 20.0;
+        voiceLevel = 8.0;
+        voiceAiScore = 0.0;
+        voiceSpikesLastMinute = 0;
+        voiceBehaviourStatus = 'Voice calm';
+        voiceContextScore = 0.0;
+        voiceContextStatus = 'No concerning words detected';
+        lastVoiceContextTime = null;
+        manualWarningTestActive = false;
+        manualWarningTestUntil = null;
+        triggerReason = 'Warning signals are settling. Watching for recovery.';
+      });
+
+      addDebugLog(
+        'Manual warning settled',
+        'Signals returned to calm values. Warning memory was kept.',
+      );
+
+      scheduleEvaluation();
+    });
+  }
+
+  void updatePatternStatusFromEngine() {
+    final warningCount5m = engine.lastMetrics?.warningCountIn5Min ?? 0;
+    warningPatternScore = warningCount5m.clamp(0, 5);
+
+    if (warningCount5m >= 3) {
+      patternStatus = 'Escalation pattern detected';
+    } else if (warningCount5m > 0) {
+      patternStatus = 'Warnings in last 5 min: $warningCount5m';
+    } else {
+      patternStatus = 'No escalation pattern';
     }
   }
 
@@ -201,6 +436,13 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     voiceContextScore = 0.0;
     voiceContextStatus = 'No concerning words detected';
     lastVoiceContextTime = null;
+    lastProcessedVoiceText = '';
+    lastProcessedVoiceTextTime = null;
+    lastConversationRiskCategory = 'calm';
+    voiceConfidenceScore = 0.0;
+    pendingVoiceText = '';
+    voiceDebounceTimer?.cancel();
+    lastNativePendingPullTime = null;
     lastAutoVoiceCheckTime = null;
     smartVoiceSessionActive = false;
     smartVoiceSessionEndTime = null;
@@ -208,6 +450,9 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     lastWarningTime = null;
     lastTriggerTime = null;
     uiWarningHoldStart = null;
+    orangeVoiceChecksThisEvent = 0;
+    orangeVoiceSamplingActive = false;
+    redRecoveryMessagePlayed = false;
 
     if (resetSignals) {
       watchHeartRate = 72;
@@ -245,6 +490,10 @@ void applyVoiceDecay() {
       voiceContextScore = 0.0;
       voiceContextStatus = 'No concerning words detected';
       lastVoiceContextTime = null;
+      lastProcessedVoiceText = '';
+      lastProcessedVoiceTextTime = null;
+      lastConversationRiskCategory = 'calm';
+      voiceConfidenceScore = 0.0;
     }
   });
   }
@@ -263,19 +512,40 @@ void applyVoiceDecay() {
     flutterTts.setCompletionHandler(() {
       if (!mounted) return;
       setState(() => isSpeaking = false);
-      if (voiceWatchMode) ensureVoiceWatchListening();
+      if (stage == AlertStage.warning) {
+        scheduleOrangeVoiceSampling(
+          delaySeconds: 0,
+          reason: 'Warning prompt finished, starting ORANGE voice sample',
+        );
+      } else if (voiceWatchMode) {
+        ensureVoiceWatchListening();
+      }
     });
 
     flutterTts.setCancelHandler(() {
       if (!mounted) return;
       setState(() => isSpeaking = false);
-      if (voiceWatchMode) ensureVoiceWatchListening();
+      if (stage == AlertStage.warning) {
+        scheduleOrangeVoiceSampling(
+          delaySeconds: 0,
+          reason: 'Warning prompt finished, starting ORANGE voice sample',
+        );
+      } else if (voiceWatchMode) {
+        ensureVoiceWatchListening();
+      }
     });
 
     flutterTts.setErrorHandler((message) {
       if (!mounted) return;
       setState(() => isSpeaking = false);
-      if (voiceWatchMode) ensureVoiceWatchListening();
+      if (stage == AlertStage.warning) {
+        scheduleOrangeVoiceSampling(
+          delaySeconds: 0,
+          reason: 'Warning prompt finished, starting ORANGE voice sample',
+        );
+      } else if (voiceWatchMode) {
+        ensureVoiceWatchListening();
+      }
     });
 
     ttsReady = true;
@@ -297,16 +567,22 @@ void applyVoiceDecay() {
             return;
           }
 
-          // Do not auto-reopen the mic here. Repeated open/close feels frustrating.
-          // A new voice check should only start from a fresh HR rise or manual button.
+          if (orangeVoiceSamplingActive) {
+            orangeVoiceSamplingActive = false;
+            addDebugLog(
+              'ORANGE voice check finished',
+              'Mic closed after short ORANGE sample. Waiting before any reassessment.',
+            );
+          }
 
-          if (voiceWatchMode &&
-              !stopVoiceWatchRequested &&
-              !isSpeaking &&
-              isAppInForeground) {
-            Future.delayed(const Duration(milliseconds: 400), () {
-              if (mounted) ensureVoiceWatchListening();
-            });
+          // Do not auto-reopen the mic immediately. ORANGE reassessments are controlled
+          // by scheduleOrangeVoiceSampling so it does not feel like a mic loop.
+          if (stage == AlertStage.warning &&
+              orangeVoiceChecksThisEvent < maxOrangeVoiceChecksPerEvent) {
+            scheduleOrangeVoiceSampling(
+              delaySeconds: orangeVoiceRecheckDelaySeconds,
+              reason: 'ORANGE still active after previous voice sample',
+            );
           }
         }
       },
@@ -336,9 +612,44 @@ void applyVoiceDecay() {
     return 'Monitoring';
   }
 
+
+  Future<void> pollPendingNativeVoiceResult() async {
+    if (!nativePendingPullSupported) return;
+
+    final now = DateTime.now();
+    if (lastNativePendingPullTime != null &&
+        now.difference(lastNativePendingPullTime!).inSeconds < 3) {
+      return;
+    }
+
+    lastNativePendingPullTime = now;
+
+    try {
+      final result = await voicePlatform.invokeMethod('getPendingVoiceResult');
+
+      if (result is Map) {
+        final text = (result['text'] ?? '').toString().trim();
+        final timestamp = result['timestamp'];
+
+        if (text.isNotEmpty) {
+          addDebugLog(
+            'Native pending voice pulled',
+            '"$text" from background buffer. Timestamp: $timestamp',
+          );
+          processVoiceText(text);
+        }
+      }
+    } catch (_) {
+      // Older native code may not have getPendingVoiceResult yet.
+      // Disable polling silently so logs do not get spammed.
+      nativePendingPullSupported = false;
+    }
+  }
+
   void startEngineLoop() {
     evaluationTimer?.cancel();
     evaluationTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      pollPendingNativeVoiceResult();
       evaluateSmartState();
       applyVoiceDecay();
     });
@@ -346,6 +657,8 @@ void applyVoiceDecay() {
 
   void scheduleEvaluation() {
     evaluationDebounceTimer?.cancel();
+    // Do NOT cancel warningAutoCalmTimer here.
+    // That timer is what lets Simulate Warning settle back to calm values.
     evaluationDebounceTimer = Timer(const Duration(milliseconds: 700), () {
       if (mounted) evaluateSmartState();
     });
@@ -357,59 +670,77 @@ void applyVoiceDecay() {
     voiceWindowTimer = Timer.periodic(const Duration(seconds: 20), (_) {
       if (!autoVoiceWindowsEnabled) return;
       if (!allowVoiceCheck && stage == AlertStage.monitoring) return;
-      if (!speechEnabled) return;
       if (isListening) return;
       if (isSpeaking) return;
       if (!isAppInForeground) return;
 
-      if (stage == AlertStage.warning || stage == AlertStage.triggered) {
-        startTemporaryListeningWindow(seconds: 12);
+      if (stage == AlertStage.triggered) return;
+
+      if (stage == AlertStage.warning) {
+        scheduleOrangeVoiceSampling(delaySeconds: 0, reason: 'Scheduled ORANGE voice reassessment');
       } else {
-        startTemporaryListeningWindow(seconds: 12);
+        startTemporaryListeningWindow(seconds: 20, reason: 'Scheduled voice check');
       }
     });
   }
 
-  Future<void> startTemporaryListeningWindow({int seconds = 15}) async {
-    if (!speechEnabled || isListening || isSpeaking || !isAppInForeground) {
-      return;
-    }
+  Future<void> startTemporaryListeningWindow({
+  int seconds = 20,
+  String reason = 'Voice check',
+}) async {
+  if (isListening || isSpeaking) return;
+  if (stage == AlertStage.triggered) return;
 
-    smartVoiceSessionActive = true;
-    smartVoiceSessionEndTime = DateTime.now().add(
-      Duration(seconds: math.max(seconds, 15)),
-    );
-    voiceContextScore = 0.0;
-    voiceContextStatus = 'No concerning words detected';
-    lastVoiceContextTime = null;
+  smartVoiceSessionActive = true;
+  smartVoiceSessionEndTime =
+      DateTime.now().add(Duration(seconds: seconds));
 
-    setState(() {
-      isListening = true;
-      appStatus = 'Checking voice';
-      heardText = 'Listening for voice check...';
-    });
+  setState(() {
+    isListening = true;
+    appStatus = 'Checking voice';
+    heardText = 'Native voice check active...';
+  });
 
+  addDebugLog(
+    reason,
+    'Native mic service requested for $seconds seconds. CalmGuard does not play mic start/end prompts.',
+  );
+
+  try {
     await speech.listen(
-      listenFor: Duration(seconds: math.max(seconds, 15)),
-      pauseFor: const Duration(seconds: 7),
+      listenFor: Duration(seconds: seconds),
+      pauseFor: const Duration(seconds: 6),
       partialResults: true,
       listenMode: stt.ListenMode.dictation,
       onResult: (result) {
         if (!mounted) return;
+
         final text = result.recognizedWords.trim();
-        setState(() {
-          heardText = text.isEmpty ? 'Listening for voice check...' : text;
-        });
-        processVoiceText(text);
+
+        if (text.isNotEmpty) {
+          setState(() => heardText = text);
+          processVoiceText(text);
+        }
       },
       onSoundLevelChange: (level) {
         if (!mounted) return;
-        final normalized = normalizeVoiceLevel(level);
-        processVoiceLevel(normalized);
+
+        final normalized =
+            ((level + 2).clamp(0, 45) / 45.0) * 100.0;
+
+        processVoiceLevel(
+          normalized.clamp(0, 100).toDouble(),
+        );
       },
     );
-  }
+  } catch (e) {
+    addDebugLog('Voice start failed', e.toString());
 
+    if (mounted) {
+      setState(() => isListening = false);
+    }
+  }
+}
   bool _shouldContinueSmartVoiceSession() {
     if (!smartVoiceSessionActive) return false;
     if (smartVoiceSessionEndTime == null) return false;
@@ -485,8 +816,8 @@ void applyVoiceDecay() {
       },
       onSoundLevelChange: (level) {
         if (!mounted) return;
-        final normalized = normalizeVoiceLevel(level);
-        processVoiceLevel(normalized);
+       final normalized = ((level + 2).clamp(0, 45) / 45.0) * 100.0;
+        processVoiceLevel(normalized.clamp(0, 100).toDouble());
       },
     );
   }
@@ -498,6 +829,12 @@ void applyVoiceDecay() {
 
     if (isListening) {
       await speech.stop();
+    }
+
+    try {
+      await voicePlatform.invokeMethod('stopVoiceService');
+    } catch (_) {
+      // Native service may not be running. Safe to ignore.
     }
 
     if (mounted) {
@@ -569,13 +906,21 @@ void applyVoiceDecay() {
       warning = false;
       triggered = false;
       appStatus = 'Recovering...';
-      triggerReason = 'Cooldown complete. Letting signals settle.';  
+      triggerReason = 'Cooldown complete. Signals reset to calm for recovery.';
+      watchHeartRate = 72;
+      stressLevel = 20;
+      smoothedWatchStress = 20.0;
+      voiceLevel = 8.0;
+      voiceAiScore = 0.0;
+      voiceSpikesLastMinute = 0;
+      voiceBehaviourStatus = 'Voice calm';
+      voiceContextScore = 0.0;
+      voiceContextStatus = 'No concerning words detected';
+      lastVoiceContextTime = null;
       voiceWatchMode = false;
       allowVoiceCheck = false;
       stopVoiceWatchRequested = true;
     });
-    return;
-  } else {
     return;
   }
 }
@@ -590,10 +935,23 @@ if (recoveryActive) {
 
     setState(() {
       appStatus = 'Monitoring';
-      triggerReason = 'Recovery complete';
+      triggerReason = 'Recovery complete. Back in calm monitoring mode.';
     });
-    return;
-  } else {
+
+    addDebugLog(
+      'RED recovery complete',
+      'Cooldown and recovery finished. CalmGuard returned to GREEN monitoring.',
+    );
+
+    if (!redRecoveryMessagePlayed) {
+      redRecoveryMessagePlayed = true;
+      Future.delayed(const Duration(milliseconds: 600), () {
+        if (!mounted) return;
+        if (!isSpeaking && stage == AlertStage.monitoring) {
+          speakMessage('You are back in calm monitoring mode.');
+        }
+      });
+    }
     return;
   }
 }
@@ -610,15 +968,7 @@ if (recoveryActive) {
     if (!mounted) return;
 
     final warningCount5m = engine.lastMetrics?.warningCountIn5Min ?? 0;
-    warningPatternScore = warningCount5m.clamp(0, 5);
-
-    if (warningCount5m >= 3) {
-      patternStatus = 'Escalation pattern detected';
-    } else if (warningCount5m > 0) {
-      patternStatus = 'Warnings in last 5 min: $warningCount5m';
-    } else {
-      patternStatus = 'No escalation pattern';
-    }
+    updatePatternStatusFromEngine();
 
     if (decision.action == EngineAction.warning &&
         stage == AlertStage.monitoring) {
@@ -626,30 +976,53 @@ if (recoveryActive) {
         stage = AlertStage.warning;
         warning = true;
         triggered = false;
-        voiceWatchMode = false; // keep mic closed during manual warning test
-        allowVoiceCheck = autoVoiceWindowsEnabled;
-        stopVoiceWatchRequested = true;
+        voiceWatchMode = true;
+        allowVoiceCheck = true;
+        stopVoiceWatchRequested = false;
+        orangeVoiceChecksThisEvent = 0;
+        orangeVoiceSamplingActive = false;
         appStatus = 'Warning';
         triggerReason = decision.reason;
         lastWarningTime = DateTime.now();
         uiWarningHoldStart = DateTime.now();
       });
 
-      if (autoVoiceWindowsEnabled) {
-        voiceWatchMode = true;
-        stopVoiceWatchRequested = false;
-        ensureVoiceWatchListening();
-      }
+      addDebugLog(
+        'ORANGE warning',
+        '${decision.reason} | HR $watchHeartRate | risk $aiStressLevel | voice ${voiceAiScore.toStringAsFixed(0)} | warnings/5m $warningCount5m',
+      );
 
       speakMessage(
         'Warning. I can sense rising pressure. Take a breath and slow down.',
       );
       vibrateWarning();
+
+      // After the warning prompt finishes, open a quiet 20-second voice sample.
+      // This follows the core CalmGuard rule: selective voice sampling only during elevated risk.
+      scheduleOrangeVoiceSampling(
+        delaySeconds: 2,
+        reason: 'ORANGE started from elevated signals',
+      );
       return;
     }
 
     if (decision.action == EngineAction.trigger &&
         stage != AlertStage.triggered) {
+      final manualWarningStillProtected = manualWarningTestActive &&
+          manualWarningTestUntil != null &&
+          DateTime.now().isBefore(manualWarningTestUntil!);
+
+      if (manualWarningStillProtected) {
+        addDebugLog(
+          'Trigger blocked during warning test',
+          'Simulate Warning is protected so ORANGE recovery can be tested without jumping to RED.',
+        );
+        return;
+      }
+
+      cancelWarningAutoCalmTimer();
+      cancelOrangeVoiceSampling();
+      redRecoveryMessagePlayed = false;
       cooldownActive = true;
       cooldownEndTime = DateTime.now().add(const Duration(seconds: 45));    
 
@@ -664,6 +1037,11 @@ if (recoveryActive) {
         triggerReason = decision.reason;
         lastTriggerTime = DateTime.now();
       });
+
+      addDebugLog(
+        'RED trigger',
+        '${decision.reason} | HR $watchHeartRate | risk $aiStressLevel | voice ${voiceAiScore.toStringAsFixed(0)}',
+      );
 
       speakMessage('Calm down. Take a breath. You are in control.');
       vibrateTrigger();
@@ -681,15 +1059,23 @@ if (recoveryActive) {
         stage = AlertStage.monitoring;
         warning = false;
         triggered = false;
+        orangeVoiceChecksThisEvent = 0;
+        orangeVoiceSamplingActive = false;
         voiceWatchMode = false;
         stopVoiceWatchRequested = true;
         allowVoiceCheck = false;
         appStatus = 'Monitoring';
         triggerReason = decision.reason;
         uiWarningHoldStart = null;
+      manualWarningTestActive = false;
+      manualWarningTestUntil = null;
       });
 
       stopVoiceListeningHard();
+      addDebugLog(
+        'Auto recovery to GREEN',
+        '${decision.reason}. Warnings/5m kept at ${engine.lastMetrics?.warningCountIn5Min ?? 0}.',
+      );
 
       Future.delayed(const Duration(milliseconds: 500), () {
         if (!mounted) return;
@@ -771,32 +1157,146 @@ if (recoveryActive) {
   }
 
   void processVoiceText(String text) {
-    final cleanText = text.toLowerCase().trim();
+  final cleanText = text.toLowerCase().trim();
+
+  if (cleanText.isEmpty) return;
+
+  // Debounce first so Android partial speech results settle
+  pendingVoiceText = cleanText;
+
+  voiceDebounceTimer?.cancel();
+
+  voiceDebounceTimer = Timer(const Duration(milliseconds: 900), () {
+    if (!mounted) return;
+
+    final finalText = pendingVoiceText.trim();
+
+    // Ignore CalmGuard's own TTS only AFTER debounce
+    if (_isCalmGuardOwnSpeech(finalText)) {
+      addDebugLog(
+        'Self voice ignored',
+        '"$finalText" matches CalmGuard TTS/self-speech suppression.',
+      );
+      return;
+    }
+
+    _processFinalVoiceText(finalText);
+  });
+}
+
+  void _processFinalVoiceText(String cleanText) {
     if (cleanText.isEmpty) return;
 
+    final now = DateTime.now();
+
+    // Ignore exact duplicate phrases for a short time so one sentence does not
+    // artificially stack into RED because of repeated native partial/final callbacks.
+    if (cleanText == lastProcessedVoiceText &&
+        lastProcessedVoiceTextTime != null &&
+        now.difference(lastProcessedVoiceTextTime!).inSeconds < 8) {
+      addDebugLog(
+        'Voice duplicate ignored',
+        '"$cleanText" was already processed recently.',
+      );
+      return;
+    }
+
     final risk = classifyConversationRisk(cleanText);
-    if (risk.score <= 0) return;
+
+    // Still remember calm/neutral text briefly so repeated calm partials do not spam.
+    if (risk.score <= 0) {
+      lastProcessedVoiceText = cleanText;
+      lastProcessedVoiceTextTime = now;
+      lastConversationRiskCategory = risk.category;
+      voiceConfidenceScore = 0.0;
+      if (mounted) {
+        setState(() {
+          heardText = cleanText;
+          voiceContextStatus = risk.label;
+        });
+      }
+      return;
+    }
+
+    final learnedHrBaseline =
+        personalHrBaselineSamples < 10 ? 72.0 : personalHrBaseline;
+
+    final hrElevated = watchHeartRate >= learnedHrBaseline + 15;
+    final riskElevated = aiStressLevel >= 45;
+    final inWarning = stage == AlertStage.warning;
+
+    final isMild = risk.category == 'mild_frustration' ||
+        risk.category == 'frustration' ||
+        risk.category == 'tension';
+
+    final isBoundary = risk.category == 'boundary' ||
+        risk.category == 'argument' ||
+        risk.category == 'repetition';
+
+    final isSerious = risk.category == 'aggressive' ||
+        risk.category == 'repeated_stop' ||
+        risk.category == 'escalation' ||
+        risk.category == 'urgent';
+
+    double adjustedScore = risk.score;
+
+    // Context weighting:
+    // Mild frustration should strengthen ORANGE, but should not instantly RED.
+    // Serious/boundary language gets more weight when body signals are also elevated.
+    if (hrElevated) adjustedScore += isMild ? 4 : 8;
+    if (riskElevated) adjustedScore += isMild ? 2 : 8;
+    if (inWarning) adjustedScore += isMild ? 0 : 6;
+
+    if (isBoundary && hrElevated) adjustedScore += 4;
+    if (isSerious && hrElevated && riskElevated) adjustedScore += 6;
+
+    // False-positive control caps.
+    if (isMild) {
+      adjustedScore = adjustedScore.clamp(0.0, 48.0);
+    } else if (isBoundary) {
+      adjustedScore = adjustedScore.clamp(0.0, 72.0);
+    } else if (risk.category == 'aggressive') {
+      adjustedScore = adjustedScore.clamp(0.0, 82.0);
+    } else if (risk.category == 'repeated_stop') {
+      adjustedScore = adjustedScore.clamp(0.0, 84.0);
+    } else if (risk.category == 'urgent') {
+      adjustedScore = adjustedScore.clamp(0.0, 95.0);
+    } else {
+      adjustedScore = adjustedScore.clamp(0.0, 100.0);
+    }
+
+    final wordCount = cleanText
+        .split(RegExp(r'\s+'))
+        .where((word) => word.trim().isNotEmpty)
+        .length;
+
+    double confidence = 45.0;
+    if (wordCount >= 3) confidence += 15;
+    if (wordCount >= 6) confidence += 10;
+    if (hrElevated) confidence += 10;
+    if (riskElevated) confidence += 10;
+    if (inWarning) confidence += 5;
+    if (isSerious) confidence += 10;
+    confidence = confidence.clamp(0.0, 100.0);
 
     setState(() {
-      voiceContextScore = risk.score;
-      lastVoiceContextTime = DateTime.now();
+      voiceContextScore = adjustedScore;
+      lastVoiceContextTime = now;
+      lastProcessedVoiceText = cleanText;
+      lastProcessedVoiceTextTime = now;
+      lastConversationRiskCategory = risk.category;
+      voiceConfidenceScore = confidence;
       voiceContextStatus = risk.label;
-      voiceAiScore = math.max(voiceAiScore, voiceContextScore);
-      voiceBehaviourStatus = voiceContextStatus;
+      voiceAiScore = math.max(voiceAiScore, adjustedScore);
+      voiceBehaviourStatus =
+          '${risk.label} • ${adjustedScore.toStringAsFixed(0)}/100 • confidence ${confidence.toStringAsFixed(0)}%';
+      heardText = cleanText;
     });
 
-    // Once we captured useful conversation risk, stop the mic session.
-    // CalmGuard should now decide and intervene, not keep listening forever.
-    if (risk.score >= 50) {
-      Future.delayed(const Duration(milliseconds: 500), () async {
-        if (!mounted) return;
-        _stopSmartVoiceSession();
-        if (isListening) {
-          await speech.stop();
-          if (mounted) setState(() => isListening = false);
-        }
-      });
-    }
+    addDebugLog(
+      'Voice meaning detected',
+      '"$cleanText" → ${risk.label}. Score ${adjustedScore.toStringAsFixed(0)} | confidence ${confidence.toStringAsFixed(0)}% | category ${risk.category}',
+    );
 
     scheduleEvaluation();
   }
@@ -823,6 +1323,65 @@ if (recoveryActive) {
         );
       }
     }
+
+  final mildStressPhrases = <String>[
+   'i am getting frustrated',
+   "i'm getting frustrated",
+   'please stop',
+   'stop please',
+   'i already told you',
+   'listen to me',
+   'why are you doing this',
+   'this is annoying',
+   'can you stop',
+   'enough already',
+];
+
+for (final phrase in mildStressPhrases) {
+  if (text.contains(phrase)) {
+    return const ConversationRisk(
+      score: 35,
+      label: 'Mild frustration detected',
+      category: 'mild_frustration',
+    );
+  }
+}
+
+final aggressivePhrases = <String>[
+  'leave me alone',
+  'get away from me',
+  'i am angry',
+  "i'm angry",
+  'dont touch me',
+  "don't touch me",
+  'go away',
+  'i hate this',
+  'shut up',
+  'stop talking',
+  'i cant take this',
+  "i can't take this",
+  'back off',
+];
+
+for (final phrase in aggressivePhrases) {
+  if (text.contains(phrase)) {
+    return const ConversationRisk(
+      score: 75,
+      label: 'Aggressive conversation detected',
+      category: 'aggressive',
+    );
+  }
+}
+
+ final stopCount = RegExp(r'\bstop\b').allMatches(text).length;
+
+if (stopCount >= 2) {
+  return const ConversationRisk(
+    score: 75,
+    label: 'Repeated STOP escalation',
+    category: 'repeated_stop',
+  );
+}
 
     final urgentSafety = <String>[
       'do not touch me',
@@ -992,6 +1551,30 @@ if (recoveryActive) {
     return (voiceContextScore * fade).clamp(0.0, 100.0);
   }
 
+  bool _isCalmGuardOwnSpeech(String text) {
+  final selfPhrases = <String>[
+    'calm down',
+    'take a breath',
+    'you are in control',
+    'warning i can sense rising pressure',
+    'i can sense rising pressure',
+    'slow down',
+    'you are back in calm monitoring mode',
+    'back in calm monitoring mode',
+    'good job you are back in calm mode',
+    'you are back in calm mode',
+    'recovery complete',
+  ];
+
+  for (final phrase in selfPhrases) {
+    if (text.contains(phrase)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
   bool _hasRepeatedWords(String text) {
     final cleaned = text.replaceAll(RegExp('[^a-zA-Z ]'), ' ');
     final words = cleaned
@@ -1011,7 +1594,7 @@ if (recoveryActive) {
   }
 
   void maybeOpenVoiceCheckFromHeartRate() {
-    if (!speechEnabled) return;
+    // Native Android voice service handles HR-rise checks.
     if (isListening || isSpeaking) return;
     if (!isAppInForeground) return;
     if (stage != AlertStage.monitoring) return;
@@ -1029,7 +1612,7 @@ if (recoveryActive) {
     }
 
     lastAutoVoiceCheckTime = now;
-    startTemporaryListeningWindow(seconds: 18);
+    startTemporaryListeningWindow(seconds: 20, reason: 'HR-rise voice check');
   }
 
   void updateVoiceBehaviour(double value) {
@@ -1054,13 +1637,23 @@ if (recoveryActive) {
       appStatus = 'Monitoring';
       triggerReason = 'Manual warning test';
       uiWarningHoldStart = null;
+      manualWarningTestActive = true;
+      manualWarningTestUntil = DateTime.now().add(const Duration(seconds: 12));
 
       // Tuned warning values: high enough for ORANGE, not high enough for instant RED.
       watchHeartRate = 95;
       stressLevel = 55;
       smoothedWatchStress = 55;
-      voiceLevel = 25.0;
+      voiceLevel = 18.0;
+      voiceAiScore = 28.0;
+      voiceBehaviourStatus = 'Manual warning voice rise';
     });
+
+    addDebugLog(
+      'Manual warning test',
+      'Temporary ORANGE spike started. Warnings/5m must be kept.',
+    );
+    scheduleManualWarningAutoCalm();
 
     await Future.delayed(const Duration(milliseconds: 150));
     evaluateSmartState();
@@ -1083,26 +1676,81 @@ if (recoveryActive) {
       appStatus = 'Monitoring';
       triggerReason = 'Manual trigger test';
       uiWarningHoldStart = null;
+      manualWarningTestActive = false;
+      manualWarningTestUntil = null;
 
       watchHeartRate = 132;
       stressLevel = 88;
       smoothedWatchStress = 88;
       voiceLevel = 86.0;
+      voiceAiScore = 88.0;
+      voiceBehaviourStatus = 'Manual trigger voice escalation';
     });
+
+    addDebugLog(
+      'Manual trigger test',
+      'RED test started with high HR, risk, and voice score.',
+    );
 
     await Future.delayed(const Duration(milliseconds: 150));
     evaluateSmartState();
   }
 
   Future<void> resetSignals() async {
-    engine.resetEngine();
+    // IMPORTANT: Do NOT call engine.resetEngine() here.
+    // Reset Signals must calm the current live signals only.
+    // Warnings / 5m memory must stay until the 5-minute window expires naturally.
+    cancelWarningAutoCalmTimer();
+    cancelOrangeVoiceSampling();
     await flutterTts.stop();
     await stopVoiceListeningHard();
 
     if (!mounted) return;
     setState(() {
-      resetLocalState(resetEngineToo: false, resetSignals: true);
+      stage = AlertStage.monitoring;
+      warning = false;
+      triggered = false;
+      cooldownActive = false;
+      recoveryActive = false;
+      cooldownEndTime = null;
+      recoveryEndTime = null;
+      appStatus = 'Monitoring';
+      triggerReason = 'Signals manually reset. Warning memory kept.';
+      heardText = 'No voice sample yet';
+      liveStressScore = 20.0;
+      aiStressLevel = 20;
+      watchHeartRate = 72;
+      stressLevel = 20;
+      smoothedWatchStress = 20.0;
+      voiceLevel = 8.0;
+      voiceAiScore = 0.0;
+      voiceSpikesLastMinute = 0;
+      voiceBehaviourStatus = 'Voice calm';
+      voiceContextScore = 0.0;
+      voiceContextStatus = 'No concerning words detected';
+      lastVoiceContextTime = null;
+      lastProcessedVoiceText = '';
+      lastProcessedVoiceTextTime = null;
+      lastConversationRiskCategory = 'calm';
+      voiceConfidenceScore = 0.0;
+      pendingVoiceText = '';
+      voiceDebounceTimer?.cancel();
+      lastAutoVoiceCheckTime = null;
+      smartVoiceSessionActive = false;
+      smartVoiceSessionEndTime = null;
+      uiWarningHoldStart = null;
+      manualWarningTestActive = false;
+      manualWarningTestUntil = null;
+      voiceEngine.reset();
+      updatePatternStatusFromEngine();
     });
+
+    addDebugLog(
+      'Reset Signals',
+      'Live signals reset to calm. Warnings/5m was kept at ${engine.lastMetrics?.warningCountIn5Min ?? 0}.',
+    );
+
+    scheduleEvaluation();
   }
 
   Color get stageColor {
@@ -1172,6 +1820,136 @@ if (recoveryActive) {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+
+  Widget buildSafetyPrivacyCard() {
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: const Padding(
+        padding: EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Safety & Privacy',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'CalmGuard is wellbeing and de-escalation support. It is not an emergency service, medical diagnosis tool, or safety guarantee.',
+              style: TextStyle(fontSize: 14),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'Prototype privacy note: voice is used for short behaviour checks. Do not store or share audio unless a future version clearly asks for consent.',
+              style: TextStyle(fontSize: 14, color: Colors.black87),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget buildSetupChecklistCard() {
+    final items = <String>[
+      speechEnabled ? 'Phone mic permission: ready' : 'Phone mic permission: not ready',
+      keepMonitoringWhenScreenLocked
+          ? 'Phone screen lock monitoring: best-effort on'
+          : 'Phone screen lock monitoring: off',
+      'Watch HR/background service: check during watch sleep',
+      'Notifications/vibration: check during warning and trigger',
+      autoVoiceWindowsEnabled
+          ? 'Automatic voice sampling: on'
+          : 'Automatic voice sampling: off',
+    ];
+
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Setup Checklist',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 8),
+            ...items.map(
+              (item) => Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.check_circle_outline, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text(item, style: const TextStyle(fontSize: 14))),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget buildDebugLogCard() {
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      child: ExpansionTile(
+        title: const Text(
+          'Logs / Debug Screen',
+          style: TextStyle(fontWeight: FontWeight.w800),
+        ),
+        subtitle: const Text('Use this when testing: HR, voice score, reason, and trigger history'),
+        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+        children: [
+          if (debugLogs.isEmpty)
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text('No logs yet. Run a warning or trigger test.'),
+            )
+          else
+            ...debugLogs.take(12).map(
+              (log) => Container(
+                width: double.infinity,
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF5F7FB),
+                  borderRadius: BorderRadius.circular(14),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${formatLogTime(log.time)} • ${log.event}',
+                      style: const TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(log.details, style: const TextStyle(fontSize: 13)),
+                  ],
+                ),
+              ),
+            ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton(
+              onPressed: () {
+                setState(() => debugLogs.clear());
+              },
+              child: const Text('Clear logs'),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1265,6 +2043,12 @@ if (recoveryActive) {
               ],
             ),
             const SizedBox(height: 18),
+            buildSafetyPrivacyCard(),
+            const SizedBox(height: 12),
+            buildSetupChecklistCard(),
+            const SizedBox(height: 12),
+            buildDebugLogCard(),
+            const SizedBox(height: 18),
             Card(
               elevation: 0,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
@@ -1278,7 +2062,7 @@ if (recoveryActive) {
                         'Automatic voice sampling',
                         style: TextStyle(fontWeight: FontWeight.w700),
                       ),
-                      subtitle: const Text('Uses short listening windows for voice behaviour checks'),
+                      subtitle: const Text('Uses selective 20-second listening windows during elevated warning states'),
                       value: autoVoiceWindowsEnabled,
                       onChanged: (value) {
                         setState(() => autoVoiceWindowsEnabled = value);
@@ -1288,8 +2072,8 @@ if (recoveryActive) {
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton(
-                        onPressed: () => startTemporaryListeningWindow(seconds: 8),
-                        child: const Text('Run voice check now'),
+                        onPressed: () => startTemporaryListeningWindow(seconds: 20, reason: 'Manual voice check'),
+                        child: const Text('Run 20-sec voice check now'),
                       ),
                     ),
                     const SizedBox(height: 10),
@@ -1316,10 +2100,10 @@ if (recoveryActive) {
                   setState(() => testPanelExpanded = value);
                 },
                 title: const Text(
-                  'Testing Panel',
+                  'Developer Testing Panel',
                   style: TextStyle(fontWeight: FontWeight.w800),
                 ),
-                subtitle: const Text('Use this to simulate HR, manual risk, and voice behaviour'),
+                subtitle: const Text('Only for prototype testing before real-world trials'),
                 childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 14),
                 children: [
                   Text(
@@ -1638,6 +2422,7 @@ class SmartTriggerEngine {
   final List<DateTime> _warningTimes = [];
 
   DateTime? _warningStart;
+  DateTime? _lastWarningAddedTime;
   DateTime? _triggerStart;
   DateTime? _calmStart;
 
@@ -1765,27 +2550,37 @@ class SmartTriggerEngine {
       );
     }
 
+    final warningHeldSeconds =
+        currentStage == AlertStage.warning && _warningStart != null
+            ? now.difference(_warningStart!).inSeconds
+            : 0;
+
     final sustainedWarning =
         currentStage == AlertStage.warning &&
         _warningStart != null &&
-        now.difference(_warningStart!).inSeconds >= 8 &&
-        score >= 0.62 &&
-        (elevatedCount >= 2 || confirmedByVoice || voiceStressStrong);
+        warningHeldSeconds >= 22 &&
+        score >= 0.80 &&
+        (elevatedCount >= 2 || voiceStressStrong);
 
     final repeatedPatternTrigger =
         currentStage == AlertStage.warning &&
+        _warningStart != null &&
+        warningHeldSeconds >= 12 &&
         _warningTimes.length >= 3 &&
-        (voiceNorm >= 0.35 || stressNorm >= 0.45);
+        score >= 0.78 &&
+        (elevatedCount >= 2 || voiceStressStrong);
 
-    final strongAllRound = hrNorm >= 0.62 && stressNorm >= 0.60 && voiceNorm >= 0.58;
+    final strongAllRound = hrNorm >= 0.66 && stressNorm >= 0.62 && voiceNorm >= 0.62;
 
-    // Smarter trigger logic:
-    // Most concerning speech should move GREEN -> ORANGE first.
-    // RED should need sustained confirmation, repeated pattern, or a very strong all-signal event.
+    // RED should not fire from one mild phrase.
+    // It now needs a short confirmation window, repeated pattern, or very strong all-signal risk.
     final instantTrigger = !likelyExercise &&
         currentStage == AlertStage.warning &&
-        (score >= 0.92 || (strongAllRound && score >= 0.82) ||
-            (voiceStressStrong && score >= 0.82));
+        _warningStart != null &&
+        warningHeldSeconds >= 7 &&
+        (score >= 0.95 ||
+            (strongAllRound && score >= 0.88) ||
+            (voiceStressStrong && stressNorm >= 0.55 && score >= 0.90));
 
     if (instantTrigger || sustainedWarning || repeatedPatternTrigger) {
       _triggerStart ??= now;
@@ -1848,10 +2643,13 @@ class SmartTriggerEngine {
   }
 
   void _addWarningTime(DateTime now) {
-    if (_warningTimes.isNotEmpty &&
-        now.difference(_warningTimes.last).inMilliseconds < 1200) {
+    // Count one meaningful ORANGE event, not every evaluation tick.
+    // This prevents warning spam while the same elevated situation is still settling.
+    if (_lastWarningAddedTime != null &&
+        now.difference(_lastWarningAddedTime!).inSeconds < 20) {
       return;
     }
+    _lastWarningAddedTime = now;
     _warningTimes.add(now);
   }
 
@@ -1978,6 +2776,7 @@ class SmartTriggerEngine {
     _history.clear();
     _warningTimes.clear();
     _warningStart = null;
+    _lastWarningAddedTime = null;
     _triggerStart = null;
     _calmStart = null;
     lastMetrics = null;

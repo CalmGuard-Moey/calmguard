@@ -1,6 +1,9 @@
 package com.example.calmguard
 
+import android.content.Intent
+import android.os.Build
 import android.util.Log
+
 import com.google.android.gms.wearable.DataClient
 import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
@@ -8,6 +11,7 @@ import com.google.android.gms.wearable.DataMapItem
 import com.google.android.gms.wearable.MessageClient
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
+
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -17,7 +21,16 @@ class MainActivity : FlutterActivity(),
     DataClient.OnDataChangedListener {
 
     private val watchChannel = "calmguard/watch"
+    private val voiceChannel = "calmguard/voice"
+
+    companion object {
+        var flutterMethodChannel: MethodChannel? = null
+        var latestVoiceResult: String? = null
+        var latestVoiceTimestamp: Long = 0L
+    }
+
     private lateinit var methodChannel: MethodChannel
+    private lateinit var voiceMethodChannel: MethodChannel
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -26,6 +39,53 @@ class MainActivity : FlutterActivity(),
             flutterEngine.dartExecutor.binaryMessenger,
             watchChannel
         )
+
+        voiceMethodChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            voiceChannel
+        )
+
+        flutterMethodChannel = voiceMethodChannel
+
+        voiceMethodChannel.setMethodCallHandler { call, result ->
+
+            when (call.method) {
+
+                "startVoiceService" -> {
+
+                    val intent = Intent(this, CalmGuardVoiceService::class.java)
+
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+
+                    result.success(true)
+                }
+
+                "stopVoiceService" -> {
+
+                    stopService(Intent(this, CalmGuardVoiceService::class.java))
+                    result.success(true)
+                }
+
+                "getPendingVoiceResult" -> {
+
+                    val resultMap = mapOf(
+                        "text" to (latestVoiceResult ?: ""),
+                        "timestamp" to latestVoiceTimestamp
+                    )
+
+                    latestVoiceResult = null
+                    latestVoiceTimestamp = 0L
+
+                    result.success(resultMap)
+                }
+
+                else -> result.notImplemented()
+            }
+        }
 
         Wearable.getMessageClient(this).addListener(this)
         Wearable.getDataClient(this).addListener(this)
@@ -38,13 +98,16 @@ class MainActivity : FlutterActivity(),
     }
 
     override fun onMessageReceived(messageEvent: MessageEvent) {
+
         val path = messageEvent.path.removePrefix("/")
         val data = String(messageEvent.data)
 
-        Log.d("CalmGuardPhone", "Received path:$path data: $data")
+        Log.d("CalmGuardPhone", "Received path:$path data:$data")
 
         runOnUiThread {
+
             when (path) {
+
                 "watch_warning",
                 "watch_trigger",
                 "watch_reset" -> {
@@ -55,24 +118,41 @@ class MainActivity : FlutterActivity(),
     }
 
     override fun onDataChanged(dataEvents: DataEventBuffer) {
+
         for (event in dataEvents) {
+
             if (event.type == DataEvent.TYPE_CHANGED) {
+
                 val item = event.dataItem
                 val path = item.uri.path ?: continue
                 val dataMap = DataMapItem.fromDataItem(item).dataMap
 
                 runOnUiThread {
+
                     when (path) {
+
                         "/heart_rate" -> {
+
                             val hr = dataMap.getInt("hr")
-                            Log.d("CalmGuardPhone", "DataClient HR: $hr")
-                            methodChannel.invokeMethod("onWatchHeartRate", hr)
+
+                            Log.d("CalmGuardPhone", "DataClient HR:$hr")
+
+                            methodChannel.invokeMethod(
+                                "onWatchHeartRate",
+                                hr
+                            )
                         }
 
                         "/stress" -> {
+
                             val stress = dataMap.getInt("stress")
-                            Log.d("CalmGuardPhone", "DataClient Stress: $stress")
-                            methodChannel.invokeMethod("onWatchStressLevel", stress)
+
+                            Log.d("CalmGuardPhone", "DataClient Stress:$stress")
+
+                            methodChannel.invokeMethod(
+                                "onWatchStressLevel",
+                                stress
+                            )
                         }
                     }
                 }
