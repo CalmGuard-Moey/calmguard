@@ -982,12 +982,27 @@ if (recoveryActive) {
 
     if (stage == AlertStage.warning) {
       if (!deepOrangeActive && warningHeldSeconds >= 10) {
-        deepOrangeActive = true;
-        deepOrangeStart = now;
-        addDebugLog(
-          'DEEP ORANGE entered',
-          'ORANGE persisted for $warningHeldSeconds seconds. Internal escalation layer activated.',
-        );
+        final hrElevated = watchHeartRate >= engine.hrBaseline + 15;
+        final stressElevated = aiStressLevel >= engine.stressBaseline + 15;
+        final voiceElevated = voiceAiScore >= engine.voiceBaseline + 15;
+        final strongVoiceContext = voiceAiScore >= 70 || voiceContextScore >= 70;
+        final elevatedSignals = <bool>[hrElevated, stressElevated, voiceElevated]
+            .where((value) => value)
+            .length;
+
+        if (elevatedSignals >= 2 || (strongVoiceContext && hrElevated)) {
+          deepOrangeActive = true;
+          deepOrangeStart = now;
+          addDebugLog(
+            'DEEP ORANGE entered',
+            'ORANGE persisted for $warningHeldSeconds seconds with sufficient signal quality. HR ${hrElevated ? 'elevated' : 'calm'}, risk ${stressElevated ? 'elevated' : 'calm'}, voice ${voiceElevated ? 'elevated' : 'calm'}, context ${strongVoiceContext ? 'strong' : 'weak'}.',
+          );
+        } else {
+          addDebugLog(
+            'DEEP ORANGE deferred',
+            'ORANGE persisted for $warningHeldSeconds seconds but signal quality is not strong enough yet. Elevated signals: $elevatedSignals, strong voice/context: $strongVoiceContext.',
+          );
+        }
       }
     } else if (deepOrangeActive) {
       deepOrangeActive = false;
