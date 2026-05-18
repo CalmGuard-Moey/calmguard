@@ -136,6 +136,9 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   bool recoveryActive = false;
   DateTime? recoveryEndTime;
 
+  bool deepOrangeActive = false;
+  DateTime? deepOrangeStart;
+
   Timer? evaluationTimer;
   Timer? voiceWindowTimer;
   Timer? evaluationDebounceTimer;
@@ -453,6 +456,8 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     orangeVoiceChecksThisEvent = 0;
     orangeVoiceSamplingActive = false;
     redRecoveryMessagePlayed = false;
+    deepOrangeActive = false;
+    deepOrangeStart = null;
 
     if (resetSignals) {
       watchHeartRate = 72;
@@ -967,7 +972,32 @@ if (recoveryActive) {
 
     if (!mounted) return;
 
+    final now = DateTime.now();
     final warningCount5m = engine.lastMetrics?.warningCountIn5Min ?? 0;
+    final warningHeldSeconds = stage == AlertStage.warning && uiWarningHoldStart != null
+        ? now.difference(uiWarningHoldStart!).inSeconds
+        : 0;
+    final currentRiskScore = engine.lastMetrics?.score ?? 0.0;
+    final sustainedVeryHighWarning = warningHeldSeconds >= 18 && currentRiskScore >= 0.92;
+
+    if (stage == AlertStage.warning) {
+      if (!deepOrangeActive && warningHeldSeconds >= 10) {
+        deepOrangeActive = true;
+        deepOrangeStart = now;
+        addDebugLog(
+          'DEEP ORANGE entered',
+          'ORANGE persisted for $warningHeldSeconds seconds. Internal escalation layer activated.',
+        );
+      }
+    } else if (deepOrangeActive) {
+      deepOrangeActive = false;
+      deepOrangeStart = null;
+      addDebugLog(
+        'DEEP ORANGE cleared',
+        'Internal escalation layer cleared because ORANGE ended.',
+      );
+    }
+
     updatePatternStatusFromEngine();
 
     if (decision.action == EngineAction.warning &&
@@ -985,6 +1015,8 @@ if (recoveryActive) {
         triggerReason = decision.reason;
         lastWarningTime = DateTime.now();
         uiWarningHoldStart = DateTime.now();
+        deepOrangeActive = false;
+        deepOrangeStart = null;
       });
 
       addDebugLog(
@@ -1016,6 +1048,14 @@ if (recoveryActive) {
         addDebugLog(
           'Trigger blocked during warning test',
           'Simulate Warning is protected so ORANGE recovery can be tested without jumping to RED.',
+        );
+        return;
+      }
+
+      if (stage == AlertStage.warning && !deepOrangeActive && !sustainedVeryHighWarning) {
+        addDebugLog(
+          'RED deferred until deep escalation persistence',
+          'Trigger deferred because ORANGE has not yet reached internal DEEP ORANGE or very high sustained risk.',
         );
         return;
       }
@@ -1741,8 +1781,8 @@ if (stopCount >= 2) {
       uiWarningHoldStart = null;
       manualWarningTestActive = false;
       manualWarningTestUntil = null;
-      voiceEngine.reset();
-      updatePatternStatusFromEngine();
+      deepOrangeActive = false;
+      deepOrangeStart = null;
     });
 
     addDebugLog(
@@ -1751,28 +1791,6 @@ if (stopCount >= 2) {
     );
 
     scheduleEvaluation();
-  }
-
-  Color get stageColor {
-    switch (stage) {
-      case AlertStage.monitoring:
-        return Colors.green;
-      case AlertStage.warning:
-        return Colors.orange;
-      case AlertStage.triggered:
-        return Colors.red;
-    }
-  }
-
-  String get stageText {
-    switch (stage) {
-      case AlertStage.monitoring:
-        return 'GREEN';
-      case AlertStage.warning:
-        return 'ORANGE';
-      case AlertStage.triggered:
-        return 'RED';
-    }
   }
 
   Widget buildSignalCard({
@@ -1970,6 +1988,30 @@ if (stopCount >= 2) {
         ],
       ),
     );
+  }
+
+  Color get stageColor {
+    switch (stage) {
+      case AlertStage.warning:
+        return Colors.orange;
+      case AlertStage.triggered:
+        return Colors.red;
+      case AlertStage.monitoring:
+      default:
+        return Colors.green;
+    }
+  }
+
+  String get stageText {
+    switch (stage) {
+      case AlertStage.warning:
+        return 'ORANGE';
+      case AlertStage.triggered:
+        return 'RED';
+      case AlertStage.monitoring:
+      default:
+        return 'GREEN';
+    }
   }
 
   @override
