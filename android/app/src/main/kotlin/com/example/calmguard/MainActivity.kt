@@ -113,6 +113,14 @@ class MainActivity : FlutterActivity(),
                 "watch_reset" -> {
                     methodChannel.invokeMethod(path, null)
                 }
+                "watch_voice_result" -> {
+                    // Forward watch mic result to Flutter voice channel
+                    try {
+                        voiceMethodChannel.invokeMethod("onNativeVoiceResult", data)
+                    } catch (e: Exception) {
+                        Log.d("CalmGuardPhone", "Failed to forward voice result: ${e.message}")
+                    }
+                }
             }
         }
     }
