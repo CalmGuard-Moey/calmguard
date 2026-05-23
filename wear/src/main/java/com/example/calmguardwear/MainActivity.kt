@@ -19,9 +19,11 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import android.util.Log
 import android.widget.Toast
+import com.google.android.gms.wearable.MessageClient
+import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
 
-class MainActivity : Activity() {
+class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
 
     private var statusText: TextView? = null
     private var monitoringText: TextView? = null
@@ -114,6 +116,7 @@ class MainActivity : Activity() {
         scrollView.addView(layout)
         setContentView(scrollView)
 
+        Wearable.getMessageClient(this).addListener(this)
         startHeartRateService()
     }
 
@@ -238,7 +241,18 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onMessageReceived(messageEvent: MessageEvent) {
+        val path = messageEvent.path.removePrefix("/")
+        Log.d("CalmGuardWear", "Received path: $path")
+        
+        if (path == "start_watch_voice_check") {
+            Log.d("CalmGuardWear", "Phone requested voice check")
+            startVoiceCheck()
+        }
+    }
+
     override fun onDestroy() {
+        Wearable.getMessageClient(this).removeListener(this)
         speechRecognizer?.destroy()
         speechRecognizer = null
         super.onDestroy()

@@ -83,12 +83,30 @@ class MainActivity : FlutterActivity(),
                     result.success(resultMap)
                 }
 
+                "requestWatchVoiceCheck" -> {
+                    sendMessageToWatch("/start_watch_voice_check", ByteArray(0))
+                    result.success(true)
+                }
+
                 else -> result.notImplemented()
             }
         }
 
         Wearable.getMessageClient(this).addListener(this)
         Wearable.getDataClient(this).addListener(this)
+    }
+
+    private fun sendMessageToWatch(path: String, payload: ByteArray) {
+        Wearable.getNodeClient(this).connectedNodes
+            .addOnSuccessListener { nodes ->
+                for (node in nodes) {
+                    Wearable.getMessageClient(this).sendMessage(node.id, path, payload)
+                    Log.d("CalmGuardPhone", "Sent $path to watch")
+                }
+            }
+            .addOnFailureListener {
+                Log.d("CalmGuardPhone", "Failed to send $path: ${it.message}")
+            }
     }
 
     override fun onDestroy() {

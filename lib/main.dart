@@ -333,13 +333,27 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
 
       addDebugLog(
         'ORANGE voice check ${orangeVoiceChecksThisEvent}/$maxOrangeVoiceChecksPerEvent',
-        '$reason. Listening for $orangeVoiceWindowSeconds seconds. No CalmGuard TTS is played at mic start/end.',
+        '$reason. Requesting watch voice first. Listening for $orangeVoiceWindowSeconds seconds.',
       );
 
-      await startTemporaryListeningWindow(
-        seconds: orangeVoiceWindowSeconds,
-        reason: 'ORANGE voice check',
-      );
+      // Try watch voice first, fallback to phone mic if request fails
+      bool watchVoiceRequested = false;
+      try {
+        await voicePlatform.invokeMethod("requestWatchVoiceCheck");
+        watchVoiceRequested = true;
+        addDebugLog('Watch voice requested', 'Watch will start listening for ORANGE voice check');
+      } catch (e) {
+        addDebugLog('Watch voice request failed', 'Falling back to phone mic: ${e.toString()}');
+        watchVoiceRequested = false;
+      }
+
+      // Only fallback to phone mic if watch request failed
+      if (!watchVoiceRequested) {
+        await startTemporaryListeningWindow(
+          seconds: orangeVoiceWindowSeconds,
+          reason: 'ORANGE voice check (phone fallback)',
+        );
+      }
 
       // If the situation is still ORANGE later, run another short check.
       // This is not always-listening. It is limited reassessment during active warning.
