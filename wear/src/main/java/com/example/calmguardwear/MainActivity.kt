@@ -12,6 +12,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.Manifest
 import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognizerIntent
 import android.speech.RecognitionListener
 import android.speech.SpeechRecognizer
@@ -30,6 +32,9 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
     private var infoText: TextView? = null
     private var speechRecognizer: SpeechRecognizer? = null
     private val REQUEST_RECORD_AUDIO = 101
+    private val voiceTimeoutHandler = Handler(Looper.getMainLooper())
+    private var voiceTimeoutRunnable: Runnable? = null
+    private val WATCH_VOICE_TIMEOUT_MS = 18000L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -161,6 +166,19 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             return
         }
 
+        voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+        voiceTimeoutRunnable = Runnable {
+            infoText?.text = "Voice check timed out"
+            Log.d("CalmGuardWear", "Voice check timed out")
+            sendStatusToPhone("/watch_voice_timeout", "")
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+            speechRecognizer = null
+        }
+        voiceTimeoutHandler.postDelayed(voiceTimeoutRunnable!!, WATCH_VOICE_TIMEOUT_MS)
+
+        sendStatusToPhone("/watch_voice_started", "")
+
         if (speechRecognizer == null) {
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this)
             speechRecognizer?.setRecognitionListener(object : RecognitionListener {
@@ -174,14 +192,24 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
                     // No-op for manual test
                 }
                 override fun onError(error: Int) {
-                    infoText?.text = "Voice check error: $error"
-                    Log.d("CalmGuardWear", "SpeechRecognizer error: $error")
-                    Toast.makeText(this@MainActivity, "Voice check error: $error", Toast.LENGTH_SHORT).show()
+                    voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+                    voiceTimeoutRunnable = null
+                    val message = getSpeechRecognizerErrorMessage(error)
+                    infoText?.text = "Voice check error: $message"
+                    Log.d("CalmGuardWear", "SpeechRecognizer error: $error ($message)")
+                    Toast.makeText(this@MainActivity, "Voice check error: $message", Toast.LENGTH_SHORT).show()
+                    if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                        sendStatusToPhone("/watch_voice_timeout", "")
+                    } else {
+                        sendStatusToPhone("/watch_voice_error", message)
+                    }
                     speechRecognizer?.cancel()
                     speechRecognizer?.destroy()
                     speechRecognizer = null
                 }
                 override fun onResults(results: Bundle?) {
+                    voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+                    voiceTimeoutRunnable = null
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val text = if (!matches.isNullOrEmpty()) matches[0] else ""
                     if (text.isNotEmpty()) {
@@ -190,7 +218,7 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
                     } else {
                         infoText?.text = "No speech recognized"
                     }
-
+                    sendStatusToPhone("/watch_voice_finished", "")
                     speechRecognizer?.stopListening()
                     speechRecognizer?.destroy()
                     speechRecognizer = null
@@ -208,9 +236,12 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             speechRecognizer?.startListening(intent)
             infoText?.text = "Listening (manual test)..."
         } catch (e: Exception) {
+            voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+            voiceTimeoutRunnable = null
             infoText?.text = "Voice error"
             Log.d("CalmGuardWear", "startListening failed: ${e.message}")
             Toast.makeText(this, "Voice start failed: ${e.message}", Toast.LENGTH_SHORT).show()
+            sendStatusToPhone("/watch_voice_error", e.message ?: "startListening failed")
         }
     }
 
@@ -225,6 +256,35 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             .addOnFailureListener {
                 Log.d("CalmGuardWear", "Failed to get nodes: ${it.message}")
             }
+    }
+
+    private fun sendStatusToPhone(path: String, payload: String = "") {
+        val bytes = payload.toByteArray(Charsets.UTF_8)
+        Wearable.getNodeClient(this).connectedNodes
+            .addOnSuccessListener { nodes ->
+                for (node in nodes) {
+                    Wearable.getMessageClient(this).sendMessage(node.id, path, bytes)
+                }
+            }
+            .addOnFailureListener {
+                Log.d("CalmGuardWear", "Failed to send status $path: ${it.message}")
+            }
+    }
+
+    private fun getSpeechRecognizerErrorMessage(error: Int): String {
+        return when (error) {
+            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+            SpeechRecognizer.ERROR_CLIENT -> "Client side error"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Insufficient permissions"
+            SpeechRecognizer.ERROR_NETWORK -> "Network error"
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+            SpeechRecognizer.ERROR_NO_MATCH -> "No clear speech detected"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy"
+            SpeechRecognizer.ERROR_SERVER -> "Server error"
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech input"
+            SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> "Too many requests"
+            else -> "Unknown speech recognition error"
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -253,6 +313,7 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
 
     override fun onDestroy() {
         Wearable.getMessageClient(this).removeListener(this)
+        voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
         speechRecognizer?.destroy()
         speechRecognizer = null
         super.onDestroy()

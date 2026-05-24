@@ -139,6 +139,34 @@ class MainActivity : FlutterActivity(),
                         Log.d("CalmGuardPhone", "Failed to forward voice result: ${e.message}")
                     }
                 }
+                "watch_voice_started" -> {
+                    try {
+                        voiceMethodChannel.invokeMethod("onWatchVoiceStarted", null)
+                    } catch (e: Exception) {
+                        Log.d("CalmGuardPhone", "Failed to forward watch voice started: ${e.message}")
+                    }
+                }
+                "watch_voice_finished" -> {
+                    try {
+                        voiceMethodChannel.invokeMethod("onWatchVoiceFinished", null)
+                    } catch (e: Exception) {
+                        Log.d("CalmGuardPhone", "Failed to forward watch voice finished: ${e.message}")
+                    }
+                }
+                "watch_voice_timeout" -> {
+                    try {
+                        voiceMethodChannel.invokeMethod("onWatchVoiceTimeout", null)
+                    } catch (e: Exception) {
+                        Log.d("CalmGuardPhone", "Failed to forward watch voice timeout: ${e.message}")
+                    }
+                }
+                "watch_voice_error" -> {
+                    try {
+                        voiceMethodChannel.invokeMethod("onWatchVoiceError", data)
+                    } catch (e: Exception) {
+                        Log.d("CalmGuardPhone", "Failed to forward watch voice error: ${e.message}")
+                    }
+                }
             }
         }
     }

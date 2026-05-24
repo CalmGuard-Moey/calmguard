@@ -204,6 +204,14 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   } else if (call.method == 'onNativeVoiceLevel') {
     final level = (call.arguments as num).toDouble();
     processVoiceLevel(normalizeVoiceLevel(level));
+  } else if (call.method == 'onWatchVoiceStarted') {
+    addDebugLog('Watch voice started', 'Watch is beginning voice recognition');
+  } else if (call.method == 'onWatchVoiceFinished') {
+    addDebugLog('Watch voice finished', 'Watch completed voice recognition');
+  } else if (call.method == 'onWatchVoiceTimeout') {
+    addDebugLog('Watch heard no clear speech', 'Watch heard no clear speech');
+  } else if (call.method == 'onWatchVoiceError') {
+    addDebugLog('Watch voice error', '${call.arguments}');
   } else if (call.method == 'onNativeVoiceListening') {
     addDebugLog('Native mic listening', '${call.arguments}');
   } else if (call.method == 'onNativeVoiceError') {
