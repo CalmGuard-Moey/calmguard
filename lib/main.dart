@@ -152,6 +152,8 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
 
   int orangeVoiceChecksThisEvent = 0;
   bool orangeVoiceSamplingActive = false;
+  bool orangeWatchReassessmentAllowed = false;
+  bool orangeSessionLocked = false;
   bool redRecoveryMessagePlayed = false;
 
   // Best-effort phone-screen/background monitoring flag.
@@ -209,9 +211,17 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   } else if (call.method == 'onWatchVoiceFinished') {
     addDebugLog('Watch voice finished', 'Watch completed voice recognition');
   } else if (call.method == 'onWatchVoiceTimeout') {
-    addDebugLog('Watch heard no clear speech', 'Watch heard no clear speech');
+    orangeWatchReassessmentAllowed = false;
+    addDebugLog(
+      'Watch heard no clear speech',
+      'Watch heard no clear speech. Watch reassessment skipped due to low/calm context.',
+    );
   } else if (call.method == 'onWatchVoiceError') {
-    addDebugLog('Watch voice error', '${call.arguments}');
+    orangeWatchReassessmentAllowed = false;
+    addDebugLog(
+      'Watch voice error',
+      '${call.arguments}. Watch reassessment skipped due to low/calm context.',
+    );
   } else if (call.method == 'onNativeVoiceListening') {
     addDebugLog('Native mic listening', '${call.arguments}');
   } else if (call.method == 'onNativeVoiceError') {
@@ -230,6 +240,11 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     initSpeech();
     startEngineLoop();
     startVoiceWindowLoop();
+    
+    addDebugLog(
+      'Watch-only monitoring active',
+      'CalmGuard initialized with watch as primary voice detection. Phone mic automatic fallback is fully paused.',
+    );
   }
 
   @override
@@ -305,16 +320,40 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     orangeVoiceRecheckTimer = null;
     orangeVoiceChecksThisEvent = 0;
     orangeVoiceSamplingActive = false;
+    orangeWatchReassessmentAllowed = false;
+  }
+
+  void unlockOrangeSession() {
+    orangeSessionLocked = false;
+    orangeVoiceChecksThisEvent = 0;
+    orangeWatchReassessmentAllowed = false;
+    addDebugLog('ORANGE session unlocked', 'ORANGE reassessment cycle complete. Ready for next ORANGE event if needed.');
   }
 
   void scheduleOrangeVoiceSampling({int delaySeconds = 2, String reason = 'ORANGE voice sampling'}) {
     if (stage != AlertStage.warning) return;
     // Native Android voice service now handles ORANGE sampling.
     // Do not block this just because Flutter speech_to_text is not active.
+    if (orangeSessionLocked && orangeVoiceChecksThisEvent > 0) {
+      addDebugLog(
+        'ORANGE session locked',
+        'Reassessment cycle already active. Wait for recovery to GREEN, RED escalation, or cooldown expiry.',
+      );
+      return;
+    }
+
     if (orangeVoiceChecksThisEvent >= maxOrangeVoiceChecksPerEvent) {
       addDebugLog(
         'ORANGE voice sampling complete',
         'Maximum short checks reached for this ORANGE event.',
+      );
+      return;
+    }
+
+    if (orangeVoiceChecksThisEvent > 0 && !orangeWatchReassessmentAllowed) {
+      addDebugLog(
+        'ORANGE watch reassessment skipped',
+        'Watch reassessment skipped due to low/calm context and not allowed for this ORANGE event.',
       );
       return;
     }
@@ -334,32 +373,37 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
       if (isListening) return;
 
       orangeVoiceChecksThisEvent++;
+      orangeSessionLocked = true;
       orangeVoiceSamplingActive = true;
       allowVoiceCheck = true;
       voiceWatchMode = true;
       stopVoiceWatchRequested = false;
+      orangeWatchReassessmentAllowed = false;
 
       addDebugLog(
         'ORANGE voice check ${orangeVoiceChecksThisEvent}/$maxOrangeVoiceChecksPerEvent',
         '$reason. Requesting watch voice first. Listening for $orangeVoiceWindowSeconds seconds.',
       );
 
-      // Try watch voice first, fallback to phone mic if request fails
       bool watchVoiceRequested = false;
       try {
         await voicePlatform.invokeMethod("requestWatchVoiceCheck");
         watchVoiceRequested = true;
         addDebugLog('Watch voice requested', 'Watch will start listening for ORANGE voice check');
       } catch (e) {
-        addDebugLog('Watch voice request failed', 'Falling back to phone mic: ${e.toString()}');
+        addDebugLog(
+          'Watch voice request failed',
+          'Watch mic request failed. Phone mic fallback paused during ORANGE sampling.',
+        );
         watchVoiceRequested = false;
       }
 
-      // Only fallback to phone mic if watch request failed
       if (!watchVoiceRequested) {
-        await startTemporaryListeningWindow(
-          seconds: orangeVoiceWindowSeconds,
-          reason: 'ORANGE voice check (phone fallback)',
+        voiceWatchMode = false;
+        allowVoiceCheck = false;
+        addDebugLog(
+          'Automatic phone mic paused',
+          'Watch mic request failed. Automatic phone mic fallback is fully paused. Watch is primary voice detection during ORANGE.',
         );
       }
 
@@ -508,6 +552,7 @@ void applyVoiceDecay() {
   setState(() { 
     voiceAiScore = (voiceAiScore - 4).clamp(0.0, 100.0);
     voiceLevel = (voiceLevel - 2).clamp(0.0, 100.0);
+    voiceContextScore = (voiceContextScore - 3).clamp(0.0, 100.0);
 
     // Reset when almost calm
     if (voiceAiScore <= 8) {
@@ -521,6 +566,7 @@ void applyVoiceDecay() {
       lastProcessedVoiceTextTime = null;
       lastConversationRiskCategory = 'calm';
       voiceConfidenceScore = 0.0;
+      addDebugLog('Voice/context decay applied', 'Aggressive voice context gradually reduced due to calm conditions.');
     }
   });
   }
@@ -1047,7 +1093,9 @@ if (recoveryActive) {
         allowVoiceCheck = true;
         stopVoiceWatchRequested = false;
         orangeVoiceChecksThisEvent = 0;
+        orangeSessionLocked = false;
         orangeVoiceSamplingActive = false;
+        orangeWatchReassessmentAllowed = true;
         appStatus = 'Warning';
         triggerReason = decision.reason;
         lastWarningTime = DateTime.now();
@@ -1099,6 +1147,7 @@ if (recoveryActive) {
 
       cancelWarningAutoCalmTimer();
       cancelOrangeVoiceSampling();
+      unlockOrangeSession();
       redRecoveryMessagePlayed = false;
       cooldownActive = true;
       cooldownEndTime = DateTime.now().add(const Duration(seconds: 45));    
@@ -1137,6 +1186,7 @@ if (recoveryActive) {
         warning = false;
         triggered = false;
         orangeVoiceChecksThisEvent = 0;
+        orangeSessionLocked = false;
         orangeVoiceSamplingActive = false;
         voiceWatchMode = false;
         stopVoiceWatchRequested = true;
@@ -1149,9 +1199,10 @@ if (recoveryActive) {
       });
 
       stopVoiceListeningHard();
+      unlockOrangeSession();
       addDebugLog(
         'Auto recovery to GREEN',
-        '${decision.reason}. Warnings/5m kept at ${engine.lastMetrics?.warningCountIn5Min ?? 0}.',
+        '${decision.reason}. Warnings/5m kept at ${engine.lastMetrics?.warningCountIn5Min ?? 0}. Watch-only monitoring now active.',
       );
 
       Future.delayed(const Duration(milliseconds: 500), () {
@@ -1375,7 +1426,25 @@ if (recoveryActive) {
       '"$cleanText" → ${risk.label}. Score ${adjustedScore.toStringAsFixed(0)} | confidence ${confidence.toStringAsFixed(0)}% | category ${risk.category}',
     );
 
+    _updateOrangeWatchReassessmentFromVoiceResult();
     scheduleEvaluation();
+  }
+
+  void _updateOrangeWatchReassessmentFromVoiceResult() {
+    if (!voiceWatchMode || stage != AlertStage.warning) return;
+
+    final strongWatchContext =
+        voiceContextScore >= 70 || voiceConfidenceScore >= 70;
+    orangeWatchReassessmentAllowed = strongWatchContext;
+
+    addDebugLog(
+      strongWatchContext
+          ? 'Watch reassessment allowed due to strong voice context'
+          : 'Watch reassessment skipped due to low/calm context',
+      strongWatchContext
+          ? 'Watch result had strong voice context and one more ORANGE watch reassessment is permitted.'
+          : 'Watch result was calm or low confidence. Do not reopen watch mic repeatedly for this ORANGE event.',
+    );
   }
 
   ConversationRisk classifyConversationRisk(String text) {

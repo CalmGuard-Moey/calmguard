@@ -33,8 +33,12 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
     private var speechRecognizer: SpeechRecognizer? = null
     private val REQUEST_RECORD_AUDIO = 101
     private val voiceTimeoutHandler = Handler(Looper.getMainLooper())
+    private var voiceTimeoutStartRunnable: Runnable? = null
     private var voiceTimeoutRunnable: Runnable? = null
-    private val WATCH_VOICE_TIMEOUT_MS = 18000L
+    private var lastWatchVoiceRequestTime = 0L
+    private val WATCH_VOICE_REQUEST_COOLDOWN_MS = 25000L
+    private val VOICE_TIMEOUT_START_DELAY_MS = 1200L
+    private val WATCH_VOICE_TIMEOUT_MS = 22000L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -166,17 +170,27 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             return
         }
 
+        voiceTimeoutStartRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
         voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+
         voiceTimeoutRunnable = Runnable {
             infoText?.text = "Voice check timed out"
+            statusText?.text = "Timeout"
             Log.d("CalmGuardWear", "Voice check timed out")
             sendStatusToPhone("/watch_voice_timeout", "")
             speechRecognizer?.cancel()
             speechRecognizer?.destroy()
             speechRecognizer = null
         }
-        voiceTimeoutHandler.postDelayed(voiceTimeoutRunnable!!, WATCH_VOICE_TIMEOUT_MS)
 
+        voiceTimeoutStartRunnable = Runnable {
+            voiceTimeoutHandler.postDelayed(voiceTimeoutRunnable!!, WATCH_VOICE_TIMEOUT_MS)
+        }
+        voiceTimeoutHandler.postDelayed(voiceTimeoutStartRunnable!!, VOICE_TIMEOUT_START_DELAY_MS)
+
+        statusText?.text = "Listening... Speak now"
+        statusText?.setTextColor(Color.YELLOW)
+        infoText?.text = "Listening... Speak now"
         sendStatusToPhone("/watch_voice_started", "")
 
         if (speechRecognizer == null) {
@@ -193,9 +207,13 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
                 }
                 override fun onError(error: Int) {
                     voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+                    voiceTimeoutStartRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
                     voiceTimeoutRunnable = null
+                    voiceTimeoutStartRunnable = null
                     val message = getSpeechRecognizerErrorMessage(error)
                     infoText?.text = "Voice check error: $message"
+                    statusText?.text = "Ready"
+                    statusText?.setTextColor(Color.GREEN)
                     Log.d("CalmGuardWear", "SpeechRecognizer error: $error ($message)")
                     Toast.makeText(this@MainActivity, "Voice check error: $message", Toast.LENGTH_SHORT).show()
                     if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
@@ -209,7 +227,9 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
                 }
                 override fun onResults(results: Bundle?) {
                     voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
+                    voiceTimeoutStartRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
                     voiceTimeoutRunnable = null
+                    voiceTimeoutStartRunnable = null
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val text = if (!matches.isNullOrEmpty()) matches[0] else ""
                     if (text.isNotEmpty()) {
@@ -218,6 +238,8 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
                     } else {
                         infoText?.text = "No speech recognized"
                     }
+                    statusText?.text = "Ready"
+                    statusText?.setTextColor(Color.GREEN)
                     sendStatusToPhone("/watch_voice_finished", "")
                     speechRecognizer?.stopListening()
                     speechRecognizer?.destroy()
@@ -229,7 +251,10 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 2500L)
         }
 
         try {
@@ -307,12 +332,27 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         
         if (path == "start_watch_voice_check") {
             Log.d("CalmGuardWear", "Phone requested voice check")
-            startVoiceCheck()
+            requestWatchVoiceCheck()
         }
+    }
+
+    private fun requestWatchVoiceCheck() {
+        val now = System.currentTimeMillis()
+        if (now - lastWatchVoiceRequestTime < WATCH_VOICE_REQUEST_COOLDOWN_MS) {
+            Log.d("CalmGuardWear", "Ignored duplicate watch voice request within cooldown window")
+            return
+        }
+        if (speechRecognizer != null) {
+            Log.d("CalmGuardWear", "Ignored watch voice request because recognition is already active")
+            return
+        }
+        lastWatchVoiceRequestTime = now
+        startVoiceCheck()
     }
 
     override fun onDestroy() {
         Wearable.getMessageClient(this).removeListener(this)
+        voiceTimeoutStartRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
         voiceTimeoutRunnable?.let { voiceTimeoutHandler.removeCallbacks(it) }
         speechRecognizer?.destroy()
         speechRecognizer = null
