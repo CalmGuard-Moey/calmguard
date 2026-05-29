@@ -125,8 +125,22 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         scrollView.addView(layout)
         setContentView(scrollView)
 
+        handleAutoStartVoiceIntent(intent)
         Wearable.getMessageClient(this).addListener(this)
         startHeartRateService()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAutoStartVoiceIntent(intent)
+    }
+
+    private fun handleAutoStartVoiceIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra("autoStartVoiceCheck", false) == true) {
+            Log.d("CalmGuardWear", "Auto-start voice check requested")
+            requestWatchVoiceCheck()
+        }
     }
 
     private fun startHeartRateService() {

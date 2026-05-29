@@ -133,6 +133,7 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   bool stopVoiceWatchRequested = false;
   bool allowVoiceCheck = false;
   bool ttsReady = false;
+  bool phoneMicAutoDisabled = true;
   bool cooldownActive = false;
   bool recoveryActive = false;
   DateTime? recoveryEndTime;
@@ -771,7 +772,16 @@ void applyVoiceDecay() {
   Future<void> startTemporaryListeningWindow({
   int seconds = 20,
   String reason = 'Voice check',
+  bool isManual = false,
 }) async {
+  if (phoneMicAutoDisabled && !isManual) {
+    addDebugLog(
+      'Automatic phone mic blocked',
+      'Automatic phone mic activation is disabled. Manual microphone tests can still be run explicitly.',
+    );
+    return;
+  }
+
   if (isListening || isSpeaking) return;
   if (stage == AlertStage.triggered) return;
 
@@ -871,6 +881,13 @@ void applyVoiceDecay() {
   }
 
   Future<void> ensureVoiceWatchListening() async {
+    if (phoneMicAutoDisabled) {
+      addDebugLog(
+        'Automatic phone mic blocked',
+        'Phone mic is disabled for automatic watch listening sessions.',
+      );
+      return;
+    }
     if (stopVoiceWatchRequested) return;
     if (!voiceWatchMode) return;
     if (!allowVoiceCheck) return;
@@ -2231,7 +2248,7 @@ if (stopCount >= 2) {
                     SizedBox(
                       width: double.infinity,
                       child: FilledButton(
-                        onPressed: () => startTemporaryListeningWindow(seconds: 20, reason: 'Manual voice check'),
+                        onPressed: () => startTemporaryListeningWindow(seconds: 20, reason: 'Manual voice check', isManual: true),
                         child: const Text('Run 20-sec voice check now'),
                       ),
                     ),
