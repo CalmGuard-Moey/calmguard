@@ -90,6 +90,7 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   double voiceContextScore = 0.0;
   String voiceContextStatus = 'No concerning words detected';
   DateTime? lastVoiceContextTime;
+  DateTime? lastVoiceDecayLogTime;
   String lastProcessedVoiceText = '';
   DateTime? lastProcessedVoiceTextTime;
   String lastConversationRiskCategory = 'calm';
@@ -549,26 +550,36 @@ void applyVoiceDecay() {
 
   // ✅ Only decay when calm conditions
   if (hrDiff <= 8 && noRecentConcern) {
-  setState(() { 
-    voiceAiScore = (voiceAiScore - 4).clamp(0.0, 100.0);
-    voiceLevel = (voiceLevel - 2).clamp(0.0, 100.0);
-    voiceContextScore = (voiceContextScore - 3).clamp(0.0, 100.0);
+    bool didResetToCalm = false;
+    setState(() {
+      voiceAiScore = (voiceAiScore - 4).clamp(0.0, 100.0);
+      voiceLevel = (voiceLevel - 2).clamp(0.0, 100.0);
+      voiceContextScore = (voiceContextScore - 3).clamp(0.0, 100.0);
 
-    // Reset when almost calm
-    if (voiceAiScore <= 8) {
-      voiceAiScore = 0.0;
-      voiceSpikesLastMinute = 0;
-      voiceBehaviourStatus = 'Voice calm';
-      voiceContextScore = 0.0;
-      voiceContextStatus = 'No concerning words detected';
-      lastVoiceContextTime = null;
-      lastProcessedVoiceText = '';
-      lastProcessedVoiceTextTime = null;
-      lastConversationRiskCategory = 'calm';
-      voiceConfidenceScore = 0.0;
-      addDebugLog('Voice/context decay applied', 'Aggressive voice context gradually reduced due to calm conditions.');
+      // Reset when almost calm
+      if (voiceAiScore <= 8) {
+        voiceAiScore = 0.0;
+        voiceSpikesLastMinute = 0;
+        voiceBehaviourStatus = 'Voice calm';
+        voiceContextScore = 0.0;
+        voiceContextStatus = 'No concerning words detected';
+        lastVoiceContextTime = null;
+        lastProcessedVoiceText = '';
+        lastProcessedVoiceTextTime = null;
+        lastConversationRiskCategory = 'calm';
+        voiceConfidenceScore = 0.0;
+        didResetToCalm = true;
+      }
+    });
+
+    // Throttle decay debug logs to at most once every 20 seconds
+    if (didResetToCalm) {
+      final now = DateTime.now();
+      if (lastVoiceDecayLogTime == null || now.difference(lastVoiceDecayLogTime!).inSeconds >= 20) {
+        addDebugLog('Voice/context decay applied', 'Aggressive voice context gradually reduced due to calm conditions.');
+        lastVoiceDecayLogTime = now;
+      }
     }
-  });
   }
 }
 
