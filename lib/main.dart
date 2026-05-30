@@ -157,6 +157,19 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
   bool orangeWatchReassessmentAllowed = false;
   bool orangeSessionLocked = false;
   bool redRecoveryMessagePlayed = false;
+  DateTime? lastOrangeSessionLockedLogTime;
+  DateTime? lastOrangeReassessmentSkippedLogTime;
+
+  // Auto-ORANGE from watch HR (conservative V1)
+  // Enable/disable feature
+  bool autoOrangeFromWatchEnabled = true;
+  // Trigger parameters
+  static const int autoOrangeMinBpmDelta = 22; // must be baseline + 22
+  static const int autoOrangeHoldSeconds = 45; // must stay elevated this long
+  static const int autoOrangeThrottleSeconds = 180; // do not trigger more than once every 3 minutes
+
+  DateTime? _autoOrangeCandidateStart;
+  DateTime? _lastAutoOrangeTriggerTime;
 
   // Best-effort phone-screen/background monitoring flag.
   // True background reliability still depends on Android foreground service + permissions.
@@ -323,12 +336,16 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     orangeVoiceChecksThisEvent = 0;
     orangeVoiceSamplingActive = false;
     orangeWatchReassessmentAllowed = false;
+    lastOrangeSessionLockedLogTime = null;
+    lastOrangeReassessmentSkippedLogTime = null;
   }
 
   void unlockOrangeSession() {
     orangeSessionLocked = false;
     orangeVoiceChecksThisEvent = 0;
     orangeWatchReassessmentAllowed = false;
+    lastOrangeSessionLockedLogTime = null;
+    lastOrangeReassessmentSkippedLogTime = null;
     addDebugLog('ORANGE session unlocked', 'ORANGE reassessment cycle complete. Ready for next ORANGE event if needed.');
   }
 
@@ -337,10 +354,15 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     // Native Android voice service now handles ORANGE sampling.
     // Do not block this just because Flutter speech_to_text is not active.
     if (orangeSessionLocked && orangeVoiceChecksThisEvent > 0) {
-      addDebugLog(
-        'ORANGE session locked',
-        'Reassessment cycle already active. Wait for recovery to GREEN, RED escalation, or cooldown expiry.',
-      );
+      // Throttle this log to at most once every 30 seconds to avoid spam
+      final now = DateTime.now();
+      if (lastOrangeSessionLockedLogTime == null || now.difference(lastOrangeSessionLockedLogTime!).inSeconds >= 30) {
+        addDebugLog(
+          'ORANGE session locked',
+          'Reassessment cycle already active. Wait for recovery to GREEN, RED escalation, or cooldown expiry.',
+        );
+        lastOrangeSessionLockedLogTime = now;
+      }
       return;
     }
 
@@ -353,10 +375,15 @@ class _CalmGuardHomeState extends State<CalmGuardHome>
     }
 
     if (orangeVoiceChecksThisEvent > 0 && !orangeWatchReassessmentAllowed) {
-      addDebugLog(
-        'ORANGE watch reassessment skipped',
-        'Watch reassessment skipped due to low/calm context and not allowed for this ORANGE event.',
-      );
+      // Throttle this log to at most once every 30 seconds to avoid spam
+      final now = DateTime.now();
+      if (lastOrangeReassessmentSkippedLogTime == null || now.difference(lastOrangeReassessmentSkippedLogTime!).inSeconds >= 30) {
+        addDebugLog(
+          'ORANGE watch reassessment skipped',
+          'Watch reassessment skipped due to low/calm context and not allowed for this ORANGE event.',
+        );
+        lastOrangeReassessmentSkippedLogTime = now;
+      }
       return;
     }
 
@@ -1277,6 +1304,105 @@ if (recoveryActive) {
 
     scheduleEvaluation();
     maybeOpenVoiceCheckFromHeartRate();
+    maybeAutoEnterOrangeFromHeartRate();
+  }
+
+  void maybeAutoEnterOrangeFromHeartRate() {
+    if (!autoOrangeFromWatchEnabled) return;
+    if (!mounted) return;
+
+    // Do not auto-trigger if not in calm monitoring state
+    if (stage != AlertStage.monitoring) {
+      _autoOrangeCandidateStart = null;
+      return;
+    }
+
+    if (cooldownActive || recoveryActive) {
+      _autoOrangeCandidateStart = null;
+      return;
+    }
+
+    if (manualWarningTestActive) {
+      // Preserve manual testing behavior
+      _autoOrangeCandidateStart = null;
+      return;
+    }
+
+    final learnedHrBaseline =
+        personalHrBaselineSamples < 10 ? 72.0 : personalHrBaseline;
+
+    final now = DateTime.now();
+
+    // Throttle repeated auto-ORANGE triggers
+    if (_lastAutoOrangeTriggerTime != null &&
+        now.difference(_lastAutoOrangeTriggerTime!).inSeconds < autoOrangeThrottleSeconds) {
+      _autoOrangeCandidateStart = null;
+      return;
+    }
+
+    final hrRise = watchHeartRate - learnedHrBaseline;
+
+    if (hrRise >= autoOrangeMinBpmDelta) {
+      // Start candidate window if not already started
+      if (_autoOrangeCandidateStart == null) {
+        _autoOrangeCandidateStart = now;
+        addDebugLog(
+          'Auto ORANGE candidate',
+          'HR $watchHeartRate >= baseline ${learnedHrBaseline.toStringAsFixed(0)} + $autoOrangeMinBpmDelta. Holding for ${autoOrangeHoldSeconds}s to confirm.',
+        );
+        return;
+      }
+
+      final held = now.difference(_autoOrangeCandidateStart!).inSeconds;
+      if (held >= autoOrangeHoldSeconds) {
+        // Confirmed sustained elevation. Enter ORANGE using same flow as evaluation.
+        _autoOrangeCandidateStart = null;
+        _lastAutoOrangeTriggerTime = now;
+
+        // Enter ORANGE (minimal, matching evaluateSmartState's ORANGE entry)
+        setState(() {
+          stage = AlertStage.warning;
+          warning = true;
+          triggered = false;
+          voiceWatchMode = true;
+          allowVoiceCheck = true;
+          stopVoiceWatchRequested = false;
+          orangeVoiceChecksThisEvent = 0;
+          orangeSessionLocked = false;
+          orangeVoiceSamplingActive = false;
+          orangeWatchReassessmentAllowed = true;
+          appStatus = 'Warning';
+          triggerReason = 'Auto ORANGE from sustained HR elevation';
+          lastWarningTime = DateTime.now();
+          uiWarningHoldStart = DateTime.now();
+          deepOrangeActive = false;
+          deepOrangeStart = null;
+        });
+
+        addDebugLog(
+          'Auto ORANGE triggered',
+          'Sustained HR elevation confirmed: HR $watchHeartRate | baseline ${learnedHrBaseline.toStringAsFixed(0)}',
+        );
+
+        // Follow same post-ORANGE actions: speak + schedule watch-first voice sampling
+        speakMessage('Warning. I can sense rising pressure. Take a breath and slow down.');
+        vibrateWarning();
+
+        scheduleOrangeVoiceSampling(
+          delaySeconds: 2,
+          reason: 'Auto ORANGE started from sustained HR elevation',
+        );
+      }
+    } else {
+      // HR fell before hold elapsed — cancel candidate if any
+      if (_autoOrangeCandidateStart != null) {
+        _autoOrangeCandidateStart = null;
+        addDebugLog(
+          'Auto ORANGE cancelled',
+          'HR fell below threshold before ${autoOrangeHoldSeconds}s hold. Current HR $watchHeartRate.',
+        );
+      }
+    }
   }
 
   void updateStressFromWatch(int value) {
